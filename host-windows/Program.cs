@@ -122,6 +122,14 @@ internal static class Program
         }
         Log.Debug($"Using {ffmpeg}");
 
+        // Two hosts would keep stealing the iPad from each other (it accepts the newest connection).
+        using var single = new Mutex(true, @"Local\IPadScreenHost.Running", out bool firstInstance);
+        if (!firstInstance)
+        {
+            Log.Error("IPadScreenHost is already running (another window, or the system tray). Close that one first.");
+            return 1;
+        }
+
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         using var input = new InputInjector();
