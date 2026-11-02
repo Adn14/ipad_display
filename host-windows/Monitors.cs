@@ -107,6 +107,26 @@ internal static unsafe class Monitors
         return result;
     }
 
+    /// <summary>True if any GPU (even one driving no display, like a laptop's dGPU) is NVIDIA.</summary>
+    public static bool HasNvidiaGpu()
+    {
+        if (CreateDXGIFactory1(IID_IDXGIFactory1, out var factory) < 0) return false;
+        try
+        {
+            for (uint a = 0; ; a++)
+            {
+                IntPtr adapter;
+                if (((delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr*, int>)Vt(factory, Slot_Factory_EnumAdapters))(factory, a, &adapter) < 0)
+                    return false;
+                DXGI_ADAPTER_DESC ad;
+                ((delegate* unmanaged[Stdcall]<IntPtr, DXGI_ADAPTER_DESC*, int>)Vt(adapter, Slot_Adapter_GetDesc))(adapter, &ad);
+                Release(adapter);
+                if (ad.VendorId == 0x10DE) return true;
+            }
+        }
+        finally { Release(factory); }
+    }
+
     private static string FriendlyName(string deviceName)
     {
         var dd = new Native.DISPLAY_DEVICEW { cb = Marshal.SizeOf<Native.DISPLAY_DEVICEW>() };

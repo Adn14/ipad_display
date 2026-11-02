@@ -45,9 +45,16 @@ internal sealed class FfmpegEncoder : IDisposable
         };
         Codec = codec;
 
+        // Pick the capture GPU by vendor, not index: the DXGI adapter order changes once CUDA is loaded
+        // in the process (e.g. NVIDIA becomes adapter 0 on hybrid laptops).
+        string captureDevice = mon.VendorId != 0 ? $"d3d11va=dx:,vendor_id=0x{mon.VendorId:X4}" : $"d3d11va=dx:{mon.AdapterIndex}";
+        // NVENC on another GPU than the one capturing: give the encoder its own CUDA device, otherwise
+        // FFmpeg hands it the capture GPU's D3D11 device and NVENC fails with "no encode device".
+        string encodeDevice = name == "nvenc" && !nativeNvidia ? "-init_hw_device cuda=cu " : "";
+
         string args =
             "-hide_banner -loglevel error -nostdin " +
-            $"-init_hw_device d3d11va=dx:{mon.AdapterIndex} -filter_hw_device dx " +
+            $"-init_hw_device \"{captureDevice}\" {encodeDevice}-filter_hw_device dx " +
             $"-filter_complex \"ddagrab=output_idx={mon.OutputIndex}:framerate={fps}:draw_mouse=1{filterTail}\" " +
             $"-an -c:v {codec} {codecArgs} -flush_packets 1 -f h264 pipe:1";
 
@@ -124,6 +131,8 @@ internal sealed class FfmpegEncoder : IDisposable
             case 0x10DE: list.Add("nvenc"); break;
             case 0x1002 or 0x1022: list.Add("amf"); break;
         }
+        // A discrete NVIDIA GPU can still encode a display drawn by another GPU (frames copied over).
+        if (!list.Contains("nvenc") && Monitors.HasNvidiaGpu()) list.Add("nvenc");
         list.Add("x264");
         return list;
     }
