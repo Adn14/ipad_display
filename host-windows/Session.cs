@@ -111,10 +111,19 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
 
             // Stream until the iPad disconnects or ffmpeg exits (e.g. display mode changed).
             var statsTimer = Stopwatch.StartNew();
+            var geometryTimer = Stopwatch.StartNew();
             long lastBytes = 0, lastAus = 0;
+            bool resized = false;
             while (!_cts.IsCancellationRequested && !enc.HasExited)
             {
                 Thread.Sleep(100);
+                if (geometryTimer.ElapsedMilliseconds >= 500)
+                {
+                    geometryTimer.Restart();
+                    var change = RefreshMonitor();
+                    if (change == GeometryChange.Gone) return;          // main loop picks the display again
+                    if (change == GeometryChange.Resized) { resized = true; break; }
+                }
                 if (opt.Verbose && statsTimer.ElapsedMilliseconds >= 5000)
                 {
                     long b = Interlocked.Read(ref _bytesSent), a = Interlocked.Read(ref enc.AccessUnits);
@@ -125,6 +134,19 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                 }
             }
             if (_cts.IsCancellationRequested) return;
+            // A mode change usually ends ffmpeg by itself; pick up the new geometry before restarting.
+            if (!resized)
+            {
+                var change = RefreshMonitor();
+                if (change == GeometryChange.Gone) return;
+                resized = change == GeometryChange.Resized;
+            }
+            if (resized)
+            {
+                Log.Info($"{monitor.DeviceName} is now {monitor.Width}x{monitor.Height}; restarting video.");
+                Thread.Sleep(300);
+                continue; // new encoder at the new size (the using disposes the old one)
+            }
 
             Log.Warn($"ffmpeg stopped unexpectedly:\n    {enc.StderrTail}");
             if (++restarts > 5) { Log.Error("Encoder keeps failing; dropping this connection."); return; }
@@ -134,6 +156,33 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
 
         if (!_cts.IsCancellationRequested)
             Log.Error("No working H.264 encoder. Run with --verbose to see FFmpeg's output, or try --encoder x264.");
+    }
+
+    private enum GeometryChange { None, Moved, Resized, Gone }
+
+    /// <summary>
+    /// Re-reads the streamed monitor's position and size. Touch input must map onto the monitor's
+    /// *current* rectangle: changing resolution or rearranging displays while connected would
+    /// otherwise make every touch land in the wrong place.
+    /// </summary>
+    private GeometryChange RefreshMonitor()
+    {
+        var now = Monitors.Enumerate().FirstOrDefault(m => m.DeviceName == monitor.DeviceName);
+        if (now is null)
+        {
+            Log.Info($"{monitor.DeviceName} went away; looking for the display again.");
+            return GeometryChange.Gone;
+        }
+        if (now.Left == monitor.Left && now.Top == monitor.Top && now.Width == monitor.Width && now.Height == monitor.Height
+            && now.OutputIndex == monitor.OutputIndex && now.VendorId == monitor.VendorId)
+            return GeometryChange.None;
+
+        bool resized = now.Width != monitor.Width || now.Height != monitor.Height
+                       || now.OutputIndex != monitor.OutputIndex || now.VendorId != monitor.VendorId;
+        monitor = now;
+        input.SetMonitor(now);
+        Log.Debug($"{now.DeviceName} geometry: {now.Width}x{now.Height} at ({now.Left},{now.Top})");
+        return resized ? GeometryChange.Resized : GeometryChange.Moved;
     }
 
     private void SendAccessUnit(List<ArraySegment<byte>> nals)
