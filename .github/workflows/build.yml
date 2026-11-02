@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ipad-app:
+    name: iPad app (unsigned .ipa)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ipad-app
+        run: xcodegen generate
+
+      - name: Build
+        working-directory: ipad-app
+        run: |
+          xcodebuild -project SecondScreen.xcodeproj -scheme SecondScreen \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package .ipa
+        working-directory: ipad-app
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/SecondScreen.app Payload/
+          zip -qry SecondScreen-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SecondScreen-unsigned-ipa
+          path: ipad-app/SecondScreen-unsigned.ipa
+
+  windows-host:
+    name: Windows host (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Publish
+        run: dotnet publish host-windows/IPadScreenHost.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPadScreenHost-win-x64
+          path: publish/IPadScreenHost.exe

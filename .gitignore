@@ -1,0 +1,10 @@
+host-windows/bin/
+host-windows/obj/
+host-windows/dist/
+ipad-app/SecondScreen.xcodeproj/
+ipad-app/build/
+ipad-app/Payload/
+*.ipa
+*.h264
+xcuserdata/
+.DS_Store
