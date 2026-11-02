@@ -18,6 +18,10 @@ final class ScreenViewController: UIViewController {
         get { defaults.bool(forKey: "showStats") }
         set { defaults.set(newValue, forKey: "showStats"); updateStatsVisibility() }
     }
+    private var playSound: Bool {
+        get { defaults.object(forKey: "playSound") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "playSound"); stream?.audio.setEnabled(newValue); rebuildMenu() }
+    }
     /// Menu button position as a fraction of the view size, so it survives rotation.
     private var buttonPosition: CGPoint {
         get {
@@ -76,6 +80,7 @@ final class ScreenViewController: UIViewController {
 
         let streamController = StreamController(port: AppConfig.port, displayLayer: displayView.displayLayer)
         stream = streamController
+        streamController.audio.setEnabled(playSound)
         input.send = { [weak streamController] data in streamController?.send(data) }
         stream.onStateChange = { [weak self] s in self?.apply(state: s) }
         stream.onHostInfo = { [weak self] info in
@@ -156,12 +161,15 @@ final class ScreenViewController: UIViewController {
                              state: input.mode == .mouse ? .on : .off) { [weak self] _ in self?.setMode(.mouse) }
         let modeMenu = UIMenu(title: "Finger input", options: .displayInline, children: [touch, mouse])
 
+        let sound = UIAction(title: "Play laptop sound", subtitle: "Pick “Virtual Audio Driver” / “iPad” as the speaker in Windows",
+                             image: UIImage(systemName: "speaker.wave.2"),
+                             state: playSound ? .on : .off) { [weak self] _ in self?.playSound.toggle() }
         let stats = UIAction(title: "Show stats", image: UIImage(systemName: "speedometer"),
                              state: showStats ? .on : .off) { [weak self] _ in self?.showStats.toggle() }
         let help = UIAction(title: "Gestures & help", image: UIImage(systemName: "questionmark.circle")) { [weak self] _ in
             self?.showHelp()
         }
-        menuButton.menu = UIMenu(title: "Second Screen", children: [modeMenu, UIMenu(options: .displayInline, children: [stats, help])])
+        menuButton.menu = UIMenu(title: "Second Screen", children: [modeMenu, UIMenu(options: .displayInline, children: [sound, stats, help])])
     }
 
     private func setMode(_ mode: InputMode) {

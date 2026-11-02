@@ -10,6 +10,8 @@ over a USB-C cable. The Windows cursor moves onto it like any second display, **
   long press = right-click, three-finger tap = middle-click.
 - **Apple Pencil → Windows pen** with pressure and tilt (works in Windows Ink apps, OneNote, Krita…).
 - **Trackpad or mouse connected to the iPad** moves and clicks the Windows cursor.
+- **Sound (optional):** the iPad appears as a speaker in Windows. Choose it for the whole PC or for single apps,
+  and the sound plays on the iPad (or on headphones/AirPods connected to it).
 
 ```
  Windows laptop                                                   iPad
@@ -61,11 +63,25 @@ laptop iTunes (Microsoft Store version) is installed, but its device service is 
 
 Plug in the iPad, unlock it and tap **Trust** when asked.
 
-### c) FFmpeg
+### c) Optional: the iPad as a speaker
+The Virtual Display Driver package also contains a **Virtual Audio Driver**. Install it from an
+**Administrator** PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File host-windows\install-audio-driver.ps1
+```
+
+A new speaker appears in Windows. Choose it in the taskbar's volume flyout (arrow next to the volume slider)
+for all sound, or per app in **Settings → System → Sound → Volume mixer**. Renaming it to "iPad"
+(**Settings → System → Sound →** the device **→ Rename**) makes it easier to spot. The host picks up a device
+named "iPad" or "Virtual Audio" automatically; any other output can be forwarded with `--audio-device NAME`.
+The **Play laptop sound** item in the app's `⋯` menu mutes it on the iPad.
+
+### d) FFmpeg
 Already installed on this laptop (`winget install Gyan.FFmpeg`). The host finds it on PATH, or you can put
 `ffmpeg.exe` next to `IPadScreenHost.exe`.
 
-### d) The host program
+### e) The host program
 `host-windows\dist\IPadScreenHost.exe` (rebuild with `host-windows\build.ps1`, which needs the .NET 9 SDK).
 It is a single self-contained exe, and the GitHub Actions build produces it too.
 
@@ -120,6 +136,8 @@ IPadScreenHost.exe --monitor 1         stream a specific monitor
 IPadScreenHost.exe --encoder x264      force an encoder: auto | qsv | nvenc | amf | x264
 IPadScreenHost.exe --fps 60 --bitrate 30
 IPadScreenHost.exe --wifi 192.168.1.20 use Wi-Fi instead of USB (IP shown in the app)
+IPadScreenHost.exe --audio-device "Speakers"   forward a different Windows output to the iPad
+IPadScreenHost.exe --no-audio          keep sound on the laptop
 IPadScreenHost.exe --test-input        check touch/pen/mouse injection works (moves the cursor)
 IPadScreenHost.exe --verbose           FFmpeg output + live fps/bitrate
 ```
@@ -140,7 +158,7 @@ IPadScreenHost.exe --verbose           FFmpeg output + live fps/bitrate
 | Laggy or blocky | Try `--bitrate 50`, or a lower resolution such as 2048×1536. On hybrid laptops the encoder used is the one on the GPU that owns the virtual display; see `--verbose`. |
 
 ## Limitations
-- No audio. Sound keeps playing from the laptop.
+- Sound on the iPad needs the Virtual Audio Driver (step 1c). It runs about 50–150 ms behind the picture.
 - The app must stay open in the foreground on the iPad. iPadOS stops background apps.
 - With a free Apple ID you must re-sign the app every 7 days.
 

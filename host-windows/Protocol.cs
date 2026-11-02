@@ -10,6 +10,8 @@ internal static class Msg
     public const byte HostHello = 0x01;   // UTF-8 JSON
     public const byte Video = 0x02;       // one H.264 access unit: repeated [u32 BIG-endian NAL length][NAL]
     public const byte HostInfo = 0x03;    // UTF-8 JSON (encoder name etc.)
+    public const byte AudioFormat = 0x04; // UTF-8 JSON {"sampleRate":48000,"channels":2}
+    public const byte Audio = 0x05;       // interleaved 16-bit little-endian PCM
 
     // iPad -> host
     public const byte ClientHello = 0x10; // UTF-8 JSON

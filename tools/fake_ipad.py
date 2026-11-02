@@ -43,14 +43,19 @@ def main():
 
     out = open(a.out, "wb")
     aus = bad = idr = 0
+    audio_bytes = peak = 0
     total = 0
     first_video = None
     t_end = None
     while True:
         mtype, length = struct.unpack("<BI", recv_exact(conn, 5))
         payload = recv_exact(conn, length)
-        if mtype in (0x01, 0x03):
+        if mtype in (0x01, 0x03, 0x04):
             print("JSON", hex(mtype), payload.decode(), flush=True)
+            continue
+        if mtype == 0x05:
+            audio_bytes += length
+            peak = max(peak, max((abs(s) for s in struct.unpack(f"<{length // 2}h", payload)), default=0))
             continue
         if mtype != 0x02:
             print("unknown type", mtype)
@@ -85,7 +90,8 @@ def main():
         if now >= t_end:
             break
     dur = time.time() - first_video
-    print(f"RESULT aus={aus} bad={bad} idr={idr} fps={aus / dur:.1f} mbps={total * 8 / dur / 1e6:.1f}", flush=True)
+    print(f"RESULT aus={aus} bad={bad} idr={idr} fps={aus / dur:.1f} mbps={total * 8 / dur / 1e6:.1f} "
+          f"audio_seconds={audio_bytes / 4 / 48000:.2f} audio_peak={peak}", flush=True)
     out.close()
     conn.close()
     sys.exit(1 if bad or aus == 0 else 0)

@@ -7,6 +7,8 @@ enum MsgType: UInt8 {
     case hostHello = 0x01   // UTF-8 JSON
     case video = 0x02       // one H.264 access unit: repeated [u32 BIG-endian NAL length][NAL]
     case hostInfo = 0x03    // UTF-8 JSON
+    case audioFormat = 0x04 // UTF-8 JSON {"sampleRate":48000,"channels":2}
+    case audio = 0x05       // interleaved 16-bit little-endian PCM
     // iPad -> host
     case clientHello = 0x10 // UTF-8 JSON
     case touch = 0x11       // [u8 count] count x { u8 id, u8 phase, f32 x, f32 y, f32 pressure }

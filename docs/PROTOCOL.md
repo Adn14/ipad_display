@@ -21,6 +21,8 @@ Coordinates are normalized to the streamed monitor: `0,0` is top-left and `1,1` 
 | `0x01` | HostHello | UTF-8 JSON `{"proto":1,"width":2732,"height":2048,"name":"LAPTOP"}` |
 | `0x02` | Video | one complete H.264 access unit (one picture): repeated `[u32 BE length][NAL unit]`. SPS/PPS come with every keyframe (once a second). |
 | `0x03` | HostInfo | UTF-8 JSON `{"encoder":"h264_qsv"}` |
+| `0x04` | AudioFormat | UTF-8 JSON `{"sampleRate":48000,"channels":2}`, sent before any audio |
+| `0x05` | Audio | interleaved 16-bit little-endian PCM (about 10 ms per message; nothing is sent while Windows is silent) |
 
 ## iPad → Host
 

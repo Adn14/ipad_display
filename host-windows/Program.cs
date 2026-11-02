@@ -4,7 +4,8 @@ namespace IPadScreenHost;
 
 internal sealed class Options
 {
-    public bool List, ShowHelp, Verbose, NoInput, TestInput;
+    public bool List, ShowHelp, Verbose, NoInput, TestInput, NoAudio;
+    public string? AudioDevice;        // null = "iPad" / "Virtual Audio" output device
     public string? Monitor;            // null = first non-primary monitor
     public string Encoder = "auto";
     public int Fps = 60;
@@ -43,6 +44,8 @@ internal sealed class Options
                 case "--ffmpeg": o.FfmpegPath = Next(); break;
                 case "--no-input": o.NoInput = true; break;
                 case "--test-input": o.TestInput = true; break;
+                case "-a" or "--audio-device": o.AudioDevice = Next(); break;
+                case "--no-audio": o.NoAudio = true; break;
                 default: throw new ArgumentException($"unknown option '{a}'");
             }
         }
@@ -63,6 +66,9 @@ internal sealed class Options
           -w, --wifi IP         connect to the iPad over Wi-Fi at IP instead of USB
           -p, --port N          TCP port the iPad app listens on                           [7878]
               --ffmpeg PATH     path to ffmpeg.exe (default: next to this exe, or on PATH)
+          -a, --audio-device NAME  Windows output device whose sound plays on the iPad
+                                (default: one named "iPad" or "Virtual Audio")
+              --no-audio        don't send sound to the iPad
               --no-input        view only; ignore touches from the iPad
               --test-input      check that touch/pen/mouse injection works (moves the cursor), then exit
           -v, --verbose         print FFmpeg output and stream statistics
@@ -92,6 +98,8 @@ internal static class Program
             var all = Monitors.Enumerate();
             if (all.Count == 0) Console.WriteLine("No monitors found.");
             foreach (var m in all) Console.WriteLine(m);
+            Console.WriteLine("\nAudio outputs (use with --audio-device):");
+            foreach (var a in AudioStreamer.ListOutputs()) Console.WriteLine($"  {a}");
             return 0;
         }
 

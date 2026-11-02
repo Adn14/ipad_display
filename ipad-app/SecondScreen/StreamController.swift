@@ -11,6 +11,7 @@ final class StreamController {
     }
 
     let renderer: VideoRenderer
+    let audio = AudioPlayer()
 
     var onStateChange: ((State) -> Void)?
     var onHostInfo: (([String: Any]) -> Void)?
@@ -84,6 +85,7 @@ final class StreamController {
             if wasCurrent { self.connection = nil }
             self.lock.unlock()
             if wasCurrent {
+                self.audio.stop()
                 DispatchQueue.main.async { self.onStateChange?(.waiting) }
             }
         }
@@ -97,6 +99,13 @@ final class StreamController {
         switch MsgType(rawValue: type) {
         case .video:
             renderer.handleAccessUnit(payload)
+        case .audio:
+            audio.enqueue(payload)
+        case .audioFormat:
+            let obj = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] ?? [:]
+            let rate = (obj["sampleRate"] as? NSNumber)?.doubleValue ?? 48000
+            let channels = (obj["channels"] as? NSNumber)?.intValue ?? 2
+            audio.configure(sampleRate: rate, channels: channels)
         case .hostHello:
             let obj = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] ?? [:]
             let name = obj["name"] as? String ?? "laptop"

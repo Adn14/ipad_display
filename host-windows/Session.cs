@@ -23,6 +23,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
         var reader = new Thread(ReadLoop) { IsBackground = true, Name = "ipad-reader" };
         reader.Start();
 
+        AudioStreamer? audio = opt.NoAudio ? null : StartAudio();
         try
         {
             StreamVideo();
@@ -30,9 +31,50 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
         finally
         {
             _cts.Cancel();
+            audio?.Dispose();
             input.ReleaseAll();
             try { stream.Dispose(); } catch { }
             reader.Join(1000);
+        }
+    }
+
+    // ------------------------------------------------------------------ audio
+
+    private static bool _warnedNoAudioDevice;
+
+    private AudioStreamer? StartAudio()
+    {
+        try
+        {
+            var streamer = AudioStreamer.TryCreate(opt.AudioDevice, pcm =>
+            {
+                if (_cts.IsCancellationRequested) return;
+                var msg = new byte[5 + pcm.Length];
+                msg[0] = Msg.Audio;
+                BinaryPrimitives.WriteUInt32LittleEndian(msg.AsSpan(1), (uint)pcm.Length);
+                pcm.CopyTo(msg, 5);
+                Write(msg);
+            });
+            if (streamer is null)
+            {
+                if (!_warnedNoAudioDevice)
+                {
+                    _warnedNoAudioDevice = true;
+                    Log.Info(opt.AudioDevice is null
+                        ? "Audio: no virtual speaker found, so sound stays on the laptop. Install the Virtual Audio Driver (see README) to get an \"iPad\" speaker."
+                        : $"Audio: output device \"{opt.AudioDevice}\" not found. Run --list to see devices.");
+                }
+                return null;
+            }
+            SendJson(Msg.AudioFormat, new { sampleRate = streamer.SampleRate, channels = 2 });
+            streamer.Start();
+            Log.Info($"Audio: anything Windows plays to \"{streamer.DeviceName}\" goes to the iPad ({streamer.SampleRate} Hz).");
+            return streamer;
+        }
+        catch (Exception e)
+        {
+            Log.Warn($"Audio capture failed to start: {e.Message}");
+            return null;
         }
     }
 
