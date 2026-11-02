@@ -67,7 +67,7 @@ internal sealed class Options
           -p, --port N          TCP port the iPad app listens on                           [7878]
               --ffmpeg PATH     path to ffmpeg.exe (default: next to this exe, or on PATH)
           -a, --audio-device NAME  Windows output device whose sound plays on the iPad
-                                (default: one named "iPad" or "Virtual Audio")
+                                (default: one named "iPad" or "CABLE Input")
               --no-audio        don't send sound to the iPad
               --no-input        view only; ignore touches from the iPad
               --test-input      check that touch/pen/mouse injection works (moves the cursor), then exit

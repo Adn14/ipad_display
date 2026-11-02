@@ -10,7 +10,8 @@ namespace IPadScreenHost;
 internal sealed class AudioStreamer : IDisposable
 {
     /// <summary>Output devices tried in order when --audio-device isn't given (name contains).</summary>
-    private static readonly string[] DefaultNames = ["iPad", "Virtual Audio"];
+    /// "CABLE Input" is VB-Audio Virtual Cable's speaker; rename any of them to "iPad" in Windows to be explicit.
+    private static readonly string[] DefaultNames = ["iPad", "CABLE Input", "Virtual Audio Driver"];
 
     /// <summary>KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: WASAPI's usual 32-bit float mix format.</summary>
     private static readonly Guid IeeeFloatSubFormat = new("00000003-0000-0010-8000-00aa00389b71");

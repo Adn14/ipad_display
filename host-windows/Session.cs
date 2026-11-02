@@ -61,7 +61,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                 {
                     _warnedNoAudioDevice = true;
                     Log.Info(opt.AudioDevice is null
-                        ? "Audio: no virtual speaker found, so sound stays on the laptop. Install the Virtual Audio Driver (see README) to get an \"iPad\" speaker."
+                        ? "Audio: no virtual speaker found, so sound stays on the laptop. Install VB-Audio Virtual Cable (see README) to get a speaker for the iPad."
                         : $"Audio: output device \"{opt.AudioDevice}\" not found. Run --list to see devices.");
                 }
                 return null;

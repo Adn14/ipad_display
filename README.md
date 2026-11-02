@@ -64,18 +64,18 @@ laptop iTunes (Microsoft Store version) is installed, but its device service is 
 Plug in the iPad, unlock it and tap **Trust** when asked.
 
 ### c) Optional: the iPad as a speaker
-The Virtual Display Driver package also contains a **Virtual Audio Driver**. Install it from an
-**Administrator** PowerShell:
+Install **VB-Audio Virtual Cable** (free, signed): download the Windows pack from
+[vb-audio.com/Cable](https://vb-audio.com/Cable/), unzip it, right-click **VBCABLE_Setup_x64.exe → Run as administrator →
+Install Driver**, then restart.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File host-windows\install-audio-driver.ps1
-```
+A new speaker called **CABLE Input** appears in Windows. Rename it to "iPad"
+(**Settings → System → Sound → CABLE Input → Rename**) so it's easy to spot. Choose it in the taskbar's volume
+flyout (arrow next to the volume slider) for all sound, or per app in **Settings → System → Sound → Volume mixer**.
+The host picks up a device named "iPad" or "CABLE Input" automatically; any other output can be forwarded with
+`--audio-device NAME`. The **Play laptop sound** item in the app's `⋯` menu mutes it on the iPad.
 
-A new speaker appears in Windows. Choose it in the taskbar's volume flyout (arrow next to the volume slider)
-for all sound, or per app in **Settings → System → Sound → Volume mixer**. Renaming it to "iPad"
-(**Settings → System → Sound →** the device **→ Rename**) makes it easier to spot. The host picks up a device
-named "iPad" or "Virtual Audio" automatically; any other output can be forwarded with `--audio-device NAME`.
-The **Play laptop sound** item in the app's `⋯` menu mutes it on the iPad.
+> The Virtual Audio Driver bundled with the Virtual Display Driver package fails to load on this laptop
+> (Device Manager error code 52: Windows can't verify its signature), so VB-CABLE is used instead.
 
 ### d) FFmpeg
 Already installed on this laptop (`winget install Gyan.FFmpeg`). The host finds it on PATH, or you can put
@@ -158,7 +158,7 @@ IPadScreenHost.exe --verbose           FFmpeg output + live fps/bitrate
 | Laggy or blocky | Try `--bitrate 50`, or a lower resolution such as 2048×1536. On hybrid laptops the encoder used is the one on the GPU that owns the virtual display; see `--verbose`. |
 
 ## Limitations
-- Sound on the iPad needs the Virtual Audio Driver (step 1c). It runs about 50–150 ms behind the picture.
+- Sound on the iPad needs VB-Audio Virtual Cable (step 1c). It runs about 50–150 ms behind the picture.
 - The app must stay open in the foreground on the iPad. iPadOS stops background apps.
 - With a free Apple ID you must re-sign the app every 7 days.
 
