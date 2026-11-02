@@ -1,4 +1,5 @@
 import AVFoundation
+import QuartzCore
 
 /// Plays the laptop's sound (16-bit interleaved PCM from the host) through the iPad's speakers,
 /// or whatever the iPad is using for audio (headphones, AirPods). Thread-safe.
@@ -13,11 +14,16 @@ final class AudioPlayer {
     private var generation = 0      // bumps on reset so callbacks from old buffers are ignored
     private var maxQueuedFrames = 0 // beyond this we're lagging: drop audio to stay in sync
     private var startFrames = 0     // small cushion before starting, against network jitter
+    private var lastConsumed = CACurrentMediaTime()
 
     init() {
         engine.attach(player)
         NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
             // Output route changed (headphones etc.): the engine stopped; restart on the next buffer.
+            self?.queue.async { self?.resetPlayback() }
+        }
+        NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] _ in
+            // Siri, a call, another app's audio...: playback was paused; start clean on the next buffer.
             self?.queue.async { self?.resetPlayback() }
         }
     }
@@ -51,7 +57,14 @@ final class AudioPlayer {
             let channels = Int(fmt.channelCount)
             let frames = pcm.count / (2 * channels)
             guard frames > 0 else { return }
-            if queuedFrames > maxQueuedFrames { return }
+            if queuedFrames > maxQueuedFrames {
+                // Normally: we're behind, so drop this chunk to catch up. But if nothing has been played
+                // for a while, the output stalled (e.g. iPadOS paused our audio): reset instead of
+                // dropping forever.
+                if CACurrentMediaTime() - lastConsumed < 0.5 { return }
+                resetPlayback()
+                engine.stop()
+            }
 
             guard let buffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frames)),
                   let out = buffer.floatChannelData else { return }
@@ -79,6 +92,7 @@ final class AudioPlayer {
                 self?.queue.async {
                     guard let self, self.generation == gen else { return }
                     self.queuedFrames = max(0, self.queuedFrames - frames)
+                    self.lastConsumed = CACurrentMediaTime()
                 }
             }
             if !player.isPlaying && queuedFrames >= startFrames { player.play() }
@@ -98,5 +112,6 @@ final class AudioPlayer {
         generation += 1
         player.stop()
         queuedFrames = 0
+        lastConsumed = CACurrentMediaTime()
     }
 }

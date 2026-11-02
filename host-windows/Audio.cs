@@ -31,9 +31,19 @@ internal sealed class AudioStreamer : IDisposable
         _capture.DataAvailable += OnData;
         _capture.RecordingStopped += (_, e) =>
         {
-            if (e.Exception != null) Log.Warn($"Audio capture stopped: {e.Exception.Message}");
+            if (_disposed) return;
+            // Windows can stop loopback capture (device reset, format change); pick it back up.
+            Log.Warn($"Audio capture stopped{(e.Exception != null ? $": {e.Exception.Message}" : "")} - restarting.");
+            Task.Delay(1000).ContinueWith(_ =>
+            {
+                if (_disposed) return;
+                try { _capture.StartRecording(); }
+                catch (Exception ex) { Log.Warn($"Audio capture could not restart: {ex.Message}"); }
+            });
         };
     }
+
+    private volatile bool _disposed;
 
     /// <summary>Prepares capture (call <see cref="Start"/>), or returns null if the output device isn't present.</summary>
     public static AudioStreamer? TryCreate(string? deviceName, Action<byte[]> onPcm)
@@ -100,6 +110,7 @@ internal sealed class AudioStreamer : IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
         try { _capture.StopRecording(); } catch { }
         _capture.Dispose();
         _device.Dispose();
