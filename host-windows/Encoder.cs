@@ -29,16 +29,17 @@ internal sealed class FfmpegEncoder : IDisposable
     {
         Name = name;
         int kbps = bitrateMbps * 1000;
-        // Frames are only produced when the screen changes (variable frame rate), so keyframes are forced
-        // by time - one per second - rather than every N frames. -g is just an upper bound.
-        int gop = fps * 10;
-        // Rate-control buffer of ~4 frames. A one-second buffer lets keyframes balloon to hundreds of KB,
-        // which take longer than a whole frame interval to cross the USB link: a hitch every second.
-        int vbv = Math.Max(kbps * 4 / fps, 256);
+        // Keyframes only when needed. A periodic keyframe redraws the whole picture at a lower quality
+        // than the frames that refine it, so still areas (the taskbar) visibly "pulse" each time one
+        // arrives. The stream starts with one; recovery (dropped frames, or the iPad's decoder asking)
+        // restarts the encoder for a fresh one. -g is only a long safety net.
+        int gop = fps * 60;
+        // Half a second of rate-control buffer: keyframes get the bits they need to match the frames
+        // around them. They're rare now, so a large one costs at most a one-off hitch.
+        int vbv = kbps / 2;
         bool nativeNvidia = mon.VendorId == 0x10DE, nativeAmd = mon.VendorId is 0x1002 or 0x1022;
 
-        // Filter chain after ddagrab, and encoder arguments, per encoder. "forced IDR" makes the timed
-        // keyframes real IDRs: the iPad (and the frame pacer's skip-until-IDR) can restart from them.
+        // Filter chain after ddagrab, and encoder arguments, per encoder.
         (string filterTail, string codec, string codecArgs) = name switch
         {
             "qsv" => (",hwmap=derive_device=qsv,format=qsv", "h264_qsv",
@@ -46,7 +47,7 @@ internal sealed class FfmpegEncoder : IDisposable
             "nvenc" => (nativeNvidia ? "" : ",hwdownload,format=bgra", "h264_nvenc",
                       $"-preset p1 -tune ull -zerolatency 1 -rc cbr -bf 0 -g {gop} -forced-idr 1 -b:v {kbps}k -bufsize {vbv}k"),
             "amf" => (nativeAmd ? "" : ",hwdownload,format=bgra,format=nv12", "h264_amf",
-                      $"-usage ultralowlatency -quality speed -rc cbr -bf 0 -g {fps} -b:v {kbps}k -bufsize {vbv}k"),
+                      $"-usage ultralowlatency -quality speed -rc cbr -bf 0 -g {gop} -b:v {kbps}k -bufsize {vbv}k"),
             "x264" => (",hwdownload,format=bgra,format=yuv420p", "libx264",
                       $"-preset ultrafast -tune zerolatency -bf 0 -g {gop} -forced-idr 1 -b:v {kbps}k -maxrate {kbps}k -bufsize {vbv}k"),
             _ => throw new ArgumentException($"unknown encoder '{name}' (use {string.Join(", ", Names)})"),
@@ -60,16 +61,15 @@ internal sealed class FfmpegEncoder : IDisposable
         // FFmpeg hands it the capture GPU's D3D11 device and NVENC fails with "no encode device".
         string encodeDevice = name == "nvenc" && !nativeNvidia ? "-init_hw_device cuda=cu " : "";
 
-        // Variable frame rate: ddagrab emits a frame only when the desktop (or the cursor) changes, and
-        // FFmpeg passes frames through as they come. Constant-rate output instead invents duplicate
-        // frames in bursts while the screen is still, and the next real frame then queues behind them.
-        // Microsecond timestamps: at 1/fps, two updates within one tick collide and the muxer discards
-        // one - and losing a P-frame corrupts every frame after it.
+        // Pass capture timing straight through: ddagrab itself repeats the last frame on a steady timer
+        // while the screen is still, whereas FFmpeg's constant-rate conversion invents duplicates in
+        // bursts. Microsecond timestamps: at 1/fps, two updates within one tick collide and the muxer
+        // discards one - and losing a P-frame corrupts every frame after it.
         string args =
             "-hide_banner -loglevel error -nostdin " +
             $"-init_hw_device \"{captureDevice}\" {encodeDevice}-filter_hw_device dx " +
             $"-filter_complex \"ddagrab=output_idx={mon.OutputIndex}:framerate={fps}:draw_mouse=1{filterTail}\" " +
-            $"-fps_mode passthrough -enc_time_base 1:1000000 -force_key_frames \"expr:gte(t,n_forced*1)\" " +
+            $"-fps_mode passthrough -enc_time_base 1:1000000 " +
             $"-an -c:v {codec} {codecArgs} -flush_packets 1 -f h264 pipe:1";
 
         Log.Debug($"ffmpeg {args}");

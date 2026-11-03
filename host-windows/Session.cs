@@ -19,6 +19,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
     private volatile int _clientProto = 1;
     private long _bytesSent;
     private long _lastAuTimestamp, _maxAuGap; // video thread; stats only
+    private bool _announced;                  // video loop only: encoder line logged / HostInfo sent
 
     private int Fps => opt.Fps > 0 ? opt.Fps : Math.Clamp(monitor.RefreshHz, 24, 120);
 
@@ -105,12 +106,15 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
 
         var candidates = _workingEncoder is { } w ? new List<string> { w } : FfmpegEncoder.Candidates(monitor, opt.Encoder);
         int restarts = 0;
+        var sinceEncoderStart = Stopwatch.StartNew();
+        _pacer.TakeKeyframeRequest(); // a new encoder starts with a keyframe anyway
 
         for (int i = 0; i < candidates.Count && !_cts.IsCancellationRequested;)
         {
             string name = candidates[i];
             int fps = Fps;
             using var enc = new FfmpegEncoder(ffmpeg, name, monitor, fps, opt.BitrateMbps, SendAccessUnit);
+            sinceEncoderStart.Restart();
 
             // Wait for the first picture; if ffmpeg dies first, this encoder doesn't work here.
             var sw = Stopwatch.StartNew();
@@ -127,19 +131,28 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                 continue;
             }
 
-            Log.Info($"Encoder: {name} ({enc.Codec}), {monitor.Width}x{monitor.Height} @ {fps} fps, {opt.BitrateMbps} Mbps" +
-                     (_pacer.Enabled ? $", pacing at {opt.MaxInFlight} frames in flight" : ""));
+            if (_workingEncoder != name || !_announced)
+                Log.Info($"Encoder: {name} ({enc.Codec}), {monitor.Width}x{monitor.Height} @ {fps} fps, {opt.BitrateMbps} Mbps" +
+                         (_pacer.Enabled ? $", pacing at {opt.MaxInFlight} frames in flight" : ""));
+            if (_workingEncoder != name || !_announced) SendJson(Msg.HostInfo, new { encoder = enc.Codec });
             _workingEncoder = name;
-            SendJson(Msg.HostInfo, new { encoder = enc.Codec });
+            _announced = true;
 
             // Stream until the iPad disconnects or ffmpeg exits (e.g. display mode changed).
             var statsTimer = Stopwatch.StartNew();
             var geometryTimer = Stopwatch.StartNew();
             long lastBytes = 0, lastAus = 0, lastDropped = _pacer.Dropped;
-            bool resized = false;
+            bool resized = false, keyframe = false;
             while (!_cts.IsCancellationRequested && !enc.HasExited)
             {
                 Thread.Sleep(100);
+                // Keyframes are on demand: FFmpeg can't be told to emit one, but a new encoder starts
+                // with one. Restarts are rate-limited so a persistently slow link can't cause a storm.
+                if (sinceEncoderStart.ElapsedMilliseconds >= 2000 && _pacer.TakeKeyframeRequest())
+                {
+                    keyframe = true;
+                    break;
+                }
                 if (geometryTimer.ElapsedMilliseconds >= 500)
                 {
                     geometryTimer.Restart();
@@ -159,6 +172,11 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                 }
             }
             if (_cts.IsCancellationRequested) return;
+            if (keyframe)
+            {
+                Log.Debug("Keyframe requested; restarting the encoder for a fresh one.");
+                continue;
+            }
             // A mode change usually ends ffmpeg by itself; pick up the new geometry before restarting.
             if (!resized)
             {
@@ -291,6 +309,10 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                         break;
                     case Msg.FrameAck when len >= 4:
                         _pacer.Ack(BinaryPrimitives.ReadUInt32LittleEndian(p));
+                        break;
+                    case Msg.KeyframeRequest:
+                        Log.Debug("The iPad asked for a keyframe.");
+                        _pacer.RequestKeyframe();
                         break;
                     case Msg.Touch when len >= 1 && !opt.NoInput:
                     {

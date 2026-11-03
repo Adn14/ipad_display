@@ -64,6 +64,7 @@ def main():
     ap.add_argument("--proto", type=int, default=2)
     ap.add_argument("--ack-delay-ms", type=float, default=0, help="delay before acking each frame")
     ap.add_argument("--slow-from", type=float, default=0, help="apply the ack delay from this second...")
+    ap.add_argument("--request-keyframe-at", type=float, default=-1, help="send a keyframe request at this second")
     ap.add_argument("--show-gaps", type=float, default=0, help="print inter-frame gaps above this many ms")
     ap.add_argument("--slow-to", type=float, default=1e9, help="...until this second")
     a = ap.parse_args()
@@ -93,6 +94,8 @@ def main():
     first_video = None
     t_end = None
     max_gap_ms = 0.0
+    requested = False
+    idr_times = []
     last_arrival = None
     while True:
         mtype, length = struct.unpack("<BI", recv_exact(conn, 5))
@@ -143,6 +146,7 @@ def main():
         ok = len(vcl_first) >= 1 and vcl_first[0] and not any(vcl_first[1:]) and o == len(payload)
         if 5 in types:
             idr += 1
+            idr_times.append(round(now - first_video, 2))
         if not ok:
             bad += 1
             print("BAD AU:", types, vcl_first[:5])
@@ -150,6 +154,10 @@ def main():
         if aus <= 2:
             print(f"AU {aus}: id={frame_id} NAL types {types[:12]}{'...' if len(types) > 12 else ''}", flush=True)
 
+        if a.request_keyframe_at >= 0 and not requested and now - first_video >= a.request_keyframe_at:
+            requested = True
+            send(conn, lock, 0x15, b"")
+            print(f"keyframe requested at t={now - first_video:.2f}s", flush=True)
         if frame_id is not None:
             elapsed = now - first_video
             slow = a.slow_from <= elapsed < a.slow_to
@@ -158,6 +166,7 @@ def main():
             break
 
     dur = time.perf_counter() - first_video
+    print(f"IDR at t= {idr_times}", flush=True)
     print(f"RESULT aus={aus} bad={bad} idr={idr} id_errors={id_errors} fps={aus / dur:.1f} "
           f"mbps={total * 8 / dur / 1e6:.1f} max_gap_ms={max_gap_ms:.0f} "
           f"audio_seconds={audio_bytes / 4 / 48000:.2f} audio_peak={peak}", flush=True)

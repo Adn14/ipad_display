@@ -209,7 +209,7 @@ internal sealed class AnnexBPacketizer(AccessUnitSink sink)
 /// the next keyframe. Rules, when too many frames are in flight:
 ///  - disposable pictures (nal_ref_idc == 0) are dropped freely;
 ///  - dropping a reference picture switches to "skip until IDR": everything is dropped until the next
-///    keyframe, which restarts a clean reference chain;
+///    keyframe, which restarts a clean reference chain (and a keyframe is requested right away);
 ///  - IDR pictures and parameter sets are never dropped.
 /// The packetizer thread calls <see cref="TryAdmit"/>; the input thread calls <see cref="Ack"/>.
 /// </summary>
@@ -219,6 +219,7 @@ internal sealed class FramePacer(int maxInFlight)
     private uint _acked;        // highest acknowledged frame id + 1 (written by the input thread)
     private bool _skipUntilIdr; // packetizer thread only
     private long _dropped;
+    private int _keyframeWanted; // 1 = someone needs an IDR soon (any thread)
 
     /// <summary>Only when the iPad sends acks (protocol v2); otherwise every frame is sent.</summary>
     public volatile bool Enabled;
@@ -239,7 +240,11 @@ internal sealed class FramePacer(int maxInFlight)
             }
             else if (!mustSend && InFlight >= maxInFlight)
             {
-                if (!au.IsDisposable) _skipUntilIdr = true;
+                if (!au.IsDisposable)
+                {
+                    _skipUntilIdr = true;
+                    RequestKeyframe(); // keyframes are on demand only: ask for one rather than wait
+                }
                 return Drop();
             }
         }
@@ -247,6 +252,12 @@ internal sealed class FramePacer(int maxInFlight)
         Volatile.Write(ref _issued, _issued + 1);
         return true;
     }
+
+    /// <summary>Ask for a fresh IDR (the session restarts the encoder). Any thread.</summary>
+    public void RequestKeyframe() => Volatile.Write(ref _keyframeWanted, 1);
+
+    /// <summary>True once per request.</summary>
+    public bool TakeKeyframeRequest() => Interlocked.Exchange(ref _keyframeWanted, 0) == 1;
 
     /// <summary>Acks may arrive out of order or be repeated; only the newest counts.</summary>
     public void Ack(uint frameId)

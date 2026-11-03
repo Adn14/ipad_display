@@ -58,15 +58,20 @@ final class VideoRenderer {
         return (statFrames, statBytes)
     }
 
+    struct Result {
+        /// Frame id to acknowledge - also for frames that couldn't be shown, so the host's pacing
+        /// never stalls waiting for them.
+        var frameId: UInt32?
+        /// The decoder can't continue until the next keyframe (the host only sends them on request).
+        var needsKeyframe = false
+    }
+
     /// Reader thread. `block` holds one Video message (protocol v2: [u32 LE frame id] first).
-    /// Returns the frame id to acknowledge - also for frames that couldn't be shown, so the host's
-    /// pacing never stalls waiting for them.
-    @discardableResult
-    func handleVideo(_ block: CMBlockBuffer, length: Int, hasFrameId: Bool) -> UInt32? {
+    func handleVideo(_ block: CMBlockBuffer, length: Int, hasFrameId: Bool) -> Result {
         var raw: UnsafeMutablePointer<CChar>?
         guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
                                           totalLengthOut: nil, dataPointerOut: &raw) == kCMBlockBufferNoErr,
-              let raw else { return nil }
+              let raw else { return Result() }
         let base = UnsafeRawPointer(raw)
 
         lock.lock()
@@ -77,7 +82,7 @@ final class VideoRenderer {
         var o = 0
         var frameId: UInt32?
         if hasFrameId {
-            guard length >= 4 else { return nil }
+            guard length >= 4 else { return Result() }
             frameId = UInt32(littleEndian: base.loadUnaligned(as: UInt32.self))
             o = 4
         }
@@ -106,22 +111,24 @@ final class VideoRenderer {
         }
 
         if parameterSetsChanged { rebuildFormatDescription() }
-        guard let format = formatDescription, pictureStart >= 0 else { return frameId }
+        guard let format = formatDescription, pictureStart >= 0 else {
+            return Result(frameId: frameId, needsKeyframe: formatDescription == nil)
+        }
         if needsKeyframe {
-            guard isKeyframe else { return frameId } // can't decode until the next keyframe
+            guard isKeyframe else { return Result(frameId: frameId, needsKeyframe: true) }
             needsKeyframe = false
         }
 
         let sampleData = contiguous
             ? Self.reference(block, offset: pictureStart, length: pictureEnd - pictureStart)
             : Self.gatherPicture(base, from: pictureStart, to: length)
-        guard let sampleData, let sampleBuffer = Self.makeSampleBuffer(sampleData, format) else { return frameId }
+        guard let sampleData, let sampleBuffer = Self.makeSampleBuffer(sampleData, format) else { return Result(frameId: frameId) }
 
         if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
             // Decoder lost state (e.g. the app was in the background): restart at the next keyframe.
             renderer.flush()
             needsKeyframe = true
-            return frameId
+            return Result(frameId: frameId, needsKeyframe: true)
         }
         renderer.enqueue(sampleBuffer)
 
@@ -129,7 +136,7 @@ final class VideoRenderer {
             deliveredFirstFrame = true
             DispatchQueue.main.async { [weak self] in self?.onFirstFrame?() }
         }
-        return frameId
+        return Result(frameId: frameId)
     }
 
     // MARK: - Helpers

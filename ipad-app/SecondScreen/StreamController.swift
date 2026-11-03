@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import QuartzCore
 
 /// Owns the listening socket, the current host connection, and the video renderer.
 /// Thread-safe; all callbacks are delivered on the main thread.
@@ -66,6 +67,7 @@ final class StreamController {
     /// Per-connection state touched only on that connection's reader thread.
     private final class Link {
         var hostProtocol = 1
+        var lastKeyframeRequest: CFTimeInterval = 0
     }
 
     private func accept(_ fd: Int32) {
@@ -85,11 +87,18 @@ final class StreamController {
 
         conn.onVideo = { [weak self, weak conn] block, length in
             guard let self else { return }
-            let frameId = self.renderer.handleVideo(block, length: length, hasFrameId: link.hostProtocol >= 2)
-            if let frameId, let conn {
+            guard let conn else { return }
+            let result = self.renderer.handleVideo(block, length: length, hasFrameId: link.hostProtocol >= 2)
+            if let frameId = result.frameId {
                 var ack = ByteBuffer()
                 ack.u32(frameId)
                 conn.send(Message.frame(.frameAck, ack.data))
+            }
+            // Keyframes come only on request: ask (at most once a second) when the decoder is stuck.
+            let now = CACurrentMediaTime()
+            if result.needsKeyframe, link.hostProtocol >= 2, now - link.lastKeyframeRequest >= 1 {
+                link.lastKeyframeRequest = now
+                conn.send(Message.frame(.keyframeRequest, Data()))
             }
         }
         conn.onMessage = { [weak self] type, payload in

@@ -15,6 +15,7 @@ enum MsgType: UInt8 {
     case pen = 0x12         // u8 phase, f32 x, f32 y, f32 pressure, f32 tiltX, f32 tiltY
     case mouse = 0x13       // u8 action, f32 x, f32 y, f32 dx, f32 dy
     case frameAck = 0x14    // v2: u32 frame id, once the frame is handed to the decoder
+    case keyframeRequest = 0x15 // v2: empty; the decoder needs an IDR (the host sends them on demand only)
 }
 
 enum TouchPhaseCode: UInt8 {

@@ -15,6 +15,7 @@ internal static class Msg
     public const byte HostHello = 0x01;   // UTF-8 JSON
     public const byte Video = 0x02;       // v2: [u32 LE frame id] then one H.264 access unit as repeated [u32 BIG-endian NAL length][NAL]
                                           // v1: the access unit only
+                                          // Keyframes are sent at the start and on demand only (no periodic IDR).
     public const byte HostInfo = 0x03;    // UTF-8 JSON (encoder name etc.)
     public const byte AudioFormat = 0x04; // UTF-8 JSON {"sampleRate":48000,"channels":2}
     public const byte Audio = 0x05;       // interleaved 16-bit little-endian PCM
@@ -25,6 +26,7 @@ internal static class Msg
     public const byte Pen = 0x12;         // u8 phase, f32 x, f32 y, f32 pressure, f32 tiltX, f32 tiltY
     public const byte Mouse = 0x13;       // u8 action, f32 x, f32 y, f32 dx, f32 dy
     public const byte FrameAck = 0x14;    // v2: u32 LE frame id, sent once the frame is handed to the decoder
+    public const byte KeyframeRequest = 0x15; // v2: empty; the iPad's decoder lost its place and needs an IDR
 
     public const int HeaderSize = 5;
     public const int MaxPayload = 32 * 1024 * 1024;
