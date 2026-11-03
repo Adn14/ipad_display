@@ -37,6 +37,36 @@ internal static unsafe class Native
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern bool EnumDisplayDevicesW(string? device, uint devNum, ref DISPLAY_DEVICEW dd, uint flags);
 
+    // ---------------------------------------------------------------- Display mode (refresh rate)
+
+    public const int ENUM_CURRENT_SETTINGS = -1;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DEVMODEW
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX, dmPositionY;            // display variant of the union
+        public uint dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public uint dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool EnumDisplaySettingsW(string deviceName, int modeNum, ref DEVMODEW devMode);
+
+    // ---------------------------------------------------------------- MMCSS (Multimedia Class Scheduler)
+
+    [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
+
+    [DllImport("avrt.dll", SetLastError = true)]
+    public static extern bool AvRevertMmThreadCharacteristics(IntPtr handle);
+
     // ---------------------------------------------------------------- Job object (kill ffmpeg with us)
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]

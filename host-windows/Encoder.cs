@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Pipelines;
 
 namespace IPadScreenHost;
 
@@ -13,6 +14,7 @@ internal sealed class FfmpegEncoder : IDisposable
     private readonly Process _proc;
     private readonly Thread _stdoutThread, _stderrThread;
     private readonly Queue<string> _stderrTail = new();
+    private readonly Task _parse;
     private volatile bool _disposed;
 
     public string Name { get; }
@@ -23,24 +25,30 @@ internal sealed class FfmpegEncoder : IDisposable
     private static readonly Lazy<IntPtr> Job = new(CreateKillOnCloseJob);
 
     public FfmpegEncoder(string ffmpegPath, string name, MonitorInfo mon, int fps, int bitrateMbps,
-                         Action<List<ArraySegment<byte>>> onAccessUnit)
+                         AccessUnitSink onAccessUnit)
     {
         Name = name;
         int kbps = bitrateMbps * 1000;
-        int gop = fps; // a keyframe every second: fast recovery if the iPad drops a frame
+        // Frames are only produced when the screen changes (variable frame rate), so keyframes are forced
+        // by time - one per second - rather than every N frames. -g is just an upper bound.
+        int gop = fps * 10;
+        // Rate-control buffer of ~4 frames. A one-second buffer lets keyframes balloon to hundreds of KB,
+        // which take longer than a whole frame interval to cross the USB link: a hitch every second.
+        int vbv = Math.Max(kbps * 4 / fps, 256);
         bool nativeNvidia = mon.VendorId == 0x10DE, nativeAmd = mon.VendorId is 0x1002 or 0x1022;
 
-        // Filter chain after ddagrab, and encoder arguments, per encoder.
+        // Filter chain after ddagrab, and encoder arguments, per encoder. "forced IDR" makes the timed
+        // keyframes real IDRs: the iPad (and the frame pacer's skip-until-IDR) can restart from them.
         (string filterTail, string codec, string codecArgs) = name switch
         {
             "qsv" => (",hwmap=derive_device=qsv,format=qsv", "h264_qsv",
-                      $"-preset veryfast -async_depth 1 -bf 0 -g {gop} -b:v {kbps}k -maxrate {kbps}k -bufsize {kbps}k"),
+                      $"-preset veryfast -async_depth 1 -bf 0 -g {gop} -forced_idr 1 -b:v {kbps}k -maxrate {kbps}k -bufsize {vbv}k"),
             "nvenc" => (nativeNvidia ? "" : ",hwdownload,format=bgra", "h264_nvenc",
-                      $"-preset p1 -tune ull -zerolatency 1 -rc cbr -bf 0 -g {gop} -b:v {kbps}k -bufsize {kbps}k"),
+                      $"-preset p1 -tune ull -zerolatency 1 -rc cbr -bf 0 -g {gop} -forced-idr 1 -b:v {kbps}k -bufsize {vbv}k"),
             "amf" => (nativeAmd ? "" : ",hwdownload,format=bgra,format=nv12", "h264_amf",
-                      $"-usage ultralowlatency -quality speed -rc cbr -bf 0 -g {gop} -b:v {kbps}k -bufsize {kbps}k"),
+                      $"-usage ultralowlatency -quality speed -rc cbr -bf 0 -g {fps} -b:v {kbps}k -bufsize {vbv}k"),
             "x264" => (",hwdownload,format=bgra,format=yuv420p", "libx264",
-                      $"-preset ultrafast -tune zerolatency -bf 0 -g {gop} -b:v {kbps}k -maxrate {kbps}k -bufsize {kbps}k"),
+                      $"-preset ultrafast -tune zerolatency -bf 0 -g {gop} -forced-idr 1 -b:v {kbps}k -maxrate {kbps}k -bufsize {vbv}k"),
             _ => throw new ArgumentException($"unknown encoder '{name}' (use {string.Join(", ", Names)})"),
         };
         Codec = codec;
@@ -52,10 +60,16 @@ internal sealed class FfmpegEncoder : IDisposable
         // FFmpeg hands it the capture GPU's D3D11 device and NVENC fails with "no encode device".
         string encodeDevice = name == "nvenc" && !nativeNvidia ? "-init_hw_device cuda=cu " : "";
 
+        // Variable frame rate: ddagrab emits a frame only when the desktop (or the cursor) changes, and
+        // FFmpeg passes frames through as they come. Constant-rate output instead invents duplicate
+        // frames in bursts while the screen is still, and the next real frame then queues behind them.
+        // Microsecond timestamps: at 1/fps, two updates within one tick collide and the muxer discards
+        // one - and losing a P-frame corrupts every frame after it.
         string args =
             "-hide_banner -loglevel error -nostdin " +
             $"-init_hw_device \"{captureDevice}\" {encodeDevice}-filter_hw_device dx " +
             $"-filter_complex \"ddagrab=output_idx={mon.OutputIndex}:framerate={fps}:draw_mouse=1{filterTail}\" " +
+            $"-fps_mode passthrough -enc_time_base 1:1000000 -force_key_frames \"expr:gte(t,n_forced*1)\" " +
             $"-an -c:v {codec} {codecArgs} -flush_packets 1 -f h264 pipe:1";
 
         Log.Debug($"ffmpeg {args}");
@@ -74,24 +88,43 @@ internal sealed class FfmpegEncoder : IDisposable
         try { Native.AssignProcessToJobObject(Job.Value, _proc.Handle); } catch { /* best effort */ }
         try { _proc.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
 
-        var splitter = new AnnexBSplitter(au =>
+        var packetizer = new AnnexBPacketizer((in AccessUnit au) =>
         {
             Interlocked.Increment(ref AccessUnits);
-            onAccessUnit(au);
+            onAccessUnit(in au);
         });
+        var pipe = AnnexBPacketizer.CreatePipe();
+        _parse = packetizer.RunAsync(pipe.Reader); // suspends at its first ReadAsync; resumes inline below
 
+        // Reads FFmpeg's stdout into the pipe. Because the reader scheduler is Inline, every flush runs
+        // the parser - and the sink's socket write - right here: read, parse and send on one thread.
         _stdoutThread = new Thread(() =>
         {
+            using var mmcss = MmcssScope.Enter("Playback");
             var stream = _proc.StandardOutput.BaseStream;
-            var buf = new byte[256 * 1024];
+            var writer = pipe.Writer;
             try
             {
-                int n;
-                while (!_disposed && (n = stream.Read(buf, 0, buf.Length)) > 0)
-                    splitter.Feed(buf.AsSpan(0, n));
+                while (!_disposed)
+                {
+                    int n = stream.Read(writer.GetSpan(64 * 1024));
+                    if (n <= 0) break;
+                    writer.Advance(n);
+                    ValueTask<FlushResult> flush = writer.FlushAsync();
+                    FlushResult r = flush.IsCompletedSuccessfully ? flush.Result : flush.AsTask().GetAwaiter().GetResult();
+                    if (r.IsCompleted) break; // parser stopped
+                }
             }
             catch (Exception e) when (_disposed || e is IOException or ObjectDisposedException) { }
-        }) { IsBackground = true, Name = "ffmpeg-stdout", Priority = ThreadPriority.AboveNormal };
+            catch (Exception e) { Log.Warn($"Video pipeline error: {e.Message}"); }
+            finally
+            {
+                writer.Complete(); // lets the parser finish and return its pooled buffers
+                // If the parser died first, FFmpeg would block forever on a full stdout pipe; end it so
+                // the session notices (HasExited) and restarts the encoder.
+                if (!_disposed) try { _proc.Kill(entireProcessTree: true); } catch { }
+            }
+        }) { IsBackground = true, Name = "ffmpeg-video", Priority = ThreadPriority.Highest };
 
         _stderrThread = new Thread(() =>
         {
@@ -143,6 +176,8 @@ internal sealed class FfmpegEncoder : IDisposable
         _disposed = true;
         try { if (!_proc.HasExited) _proc.Kill(entireProcessTree: true); } catch { }
         try { _proc.WaitForExit(2000); } catch { }
+        _stdoutThread.Join(2000); // completes the pipe writer, which ends the parser
+        try { _parse.Wait(1000); } catch (AggregateException e) { Log.Debug($"parser: {e.InnerException?.Message}"); }
         _proc.Dispose();
     }
 

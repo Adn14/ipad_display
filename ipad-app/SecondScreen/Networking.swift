@@ -1,5 +1,6 @@
-import Foundation
+import CoreMedia
 import Darwin
+import Foundation
 
 /// TCP listener on all interfaces. Over USB-C the Windows host reaches it through Apple's usbmux
 /// tunnel (arriving as a loopback connection); in Wi-Fi mode it connects directly.
@@ -74,9 +75,17 @@ final class SocketServer {
 }
 
 /// One connected host. Reads framed messages on a dedicated thread; writes on a serial queue.
+///
+/// Receive path, zero-copy: a video message is read from the socket *directly* into a CMBlockBuffer
+/// taken from a CMMemoryPool. The decoder takes ownership of that buffer (it decodes asynchronously,
+/// so it must never be handed a pointer into a receive buffer that the next read() would overwrite).
+/// One copy - kernel to block buffer - and no per-frame malloc once the pool is warm.
+/// Other messages are small: they are read into one reusable scratch buffer and lent to the handler.
 final class ClientConnection {
-    /// Called on the reader thread.
-    var onMessage: ((UInt8, Data) -> Void)?
+    /// Reader thread. One video message; the connection hands over its only reference to `block`.
+    var onVideo: ((CMBlockBuffer, Int) -> Void)?
+    /// Reader thread. Any other message. The bytes are only valid during the call: copy what you keep.
+    var onMessage: ((UInt8, UnsafeRawBufferPointer) -> Void)?
     /// Called once, on the reader thread, after the socket is closed.
     var onClose: (() -> Void)?
 
@@ -84,6 +93,9 @@ final class ClientConnection {
     private let sendQueue = DispatchQueue(label: "secondscreen.send", qos: .userInteractive)
     private let stateLock = NSLock()
     private var isShutDown = false
+    private let videoPool = CMMemoryPoolCreate(options: nil)
+
+    private static let maxMessage = 64 * 1024 * 1024
 
     init(fd: Int32) { self.fd = fd }
 
@@ -123,24 +135,57 @@ final class ClientConnection {
     }
 
     private func readLoop() {
-        var header = [UInt8](repeating: 0, count: 5)
+        let header = UnsafeMutableRawPointer.allocate(byteCount: 8, alignment: 8)
+        var scratchCapacity = 64 * 1024
+        var scratch = UnsafeMutableRawPointer.allocate(byteCount: scratchCapacity, alignment: 16)
+        let allocator = CMMemoryPoolGetAllocator(videoPool)
+        defer {
+            header.deallocate()
+            scratch.deallocate()
+        }
+
         while true {
-            let gotHeader = header.withUnsafeMutableBytes { readExact($0.baseAddress!, 5) }
-            if !gotHeader { break }
-            let type = header[0]
-            let len = Int(UInt32(header[1]) | UInt32(header[2]) << 8 | UInt32(header[3]) << 16 | UInt32(header[4]) << 24)
-            if len > 64 * 1024 * 1024 { break }
-            var payload = Data(count: len)
-            if len > 0 {
-                let ok = payload.withUnsafeMutableBytes { readExact($0.baseAddress!, len) }
-                if !ok { break }
+            guard readExact(header, 5) else { break }
+            let type = header.load(as: UInt8.self)
+            let len = Int(UInt32(littleEndian: header.loadUnaligned(fromByteOffset: 1, as: UInt32.self)))
+            guard len <= Self.maxMessage else { break }
+
+            if type == MsgType.video.rawValue {
+                guard len > 0, let target = makeBlockBuffer(length: len, allocator: allocator),
+                      readExact(target.data, len) else { break }
+                onVideo?(target.block, len)
+            } else {
+                if len > scratchCapacity {
+                    scratch.deallocate()
+                    scratchCapacity = len
+                    scratch = UnsafeMutableRawPointer.allocate(byteCount: len, alignment: 16)
+                }
+                if len > 0 { guard readExact(scratch, len) else { break } }
+                onMessage?(type, UnsafeRawBufferPointer(start: scratch, count: len))
             }
-            onMessage?(type, payload)
         }
         disconnect()
         sendQueue.sync { } // let pending writes finish before the fd number can be reused
         close(fd)
+        // Pooled memory still owned by the decoder is freed when the decoder releases it.
+        CMMemoryPoolInvalidate(videoPool)
         onClose?()
+    }
+
+    /// A contiguous block buffer of `length` bytes from the pool, plus a pointer to write into it.
+    private func makeBlockBuffer(length: Int, allocator: CFAllocator) -> (block: CMBlockBuffer, data: UnsafeMutableRawPointer)? {
+        var block: CMBlockBuffer?
+        let status = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: length,
+            blockAllocator: allocator, customBlockSource: nil,
+            offsetToData: 0, dataLength: length,
+            flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
+        guard status == kCMBlockBufferNoErr, let block else { return nil }
+        var data: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                          totalLengthOut: nil, dataPointerOut: &data) == kCMBlockBufferNoErr,
+              let data else { return nil }
+        return (block, UnsafeMutableRawPointer(data))
     }
 
     private func readExact(_ ptr: UnsafeMutableRawPointer, _ count: Int) -> Bool {

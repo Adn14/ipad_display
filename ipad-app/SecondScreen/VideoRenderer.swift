@@ -2,8 +2,16 @@ import AVFoundation
 import CoreMedia
 import UIKit
 
-/// Feeds H.264 access units from the host into an AVSampleBufferDisplayLayer (hardware decode,
-/// shown immediately - no buffering, lowest latency).
+/// Feeds H.264 access units from the host into an AVSampleBufferDisplayLayer: hardware decode, each
+/// picture marked "display immediately" (no presentation queue, no timebase).
+///
+/// Zero-copy: the message arrives in a CMBlockBuffer the socket reader filled. The picture's NAL units
+/// (already AVCC: [u32 BE length][NAL]) are wrapped with a block-buffer *reference* into that same
+/// memory - only the parameter sets (SPS/PPS) are copied, and only when they change.
+///
+/// Threading: everything runs under `lock` on the caller's thread (the socket reader), including the
+/// enqueue into the decoder. Submitting from the main thread instead adds a hop, and whatever the UI
+/// is doing (touch handling, menus) delays the frame.
 final class VideoRenderer {
     let displayLayer: AVSampleBufferDisplayLayer
 
@@ -12,6 +20,7 @@ final class VideoRenderer {
     /// Main thread. First picture of a connection was handed to the decoder.
     var onFirstFrame: (() -> Void)?
 
+    private let renderer: AVSampleBufferVideoRenderer
     private let lock = NSLock()
     private var sps: Data?
     private var pps: Data?
@@ -22,8 +31,10 @@ final class VideoRenderer {
     private var statFrames = 0
     private var statBytes = 0
 
+    /// Main thread.
     init(displayLayer: AVSampleBufferDisplayLayer) {
         self.displayLayer = displayLayer
+        renderer = displayLayer.sampleBufferRenderer
         displayLayer.videoGravity = .resizeAspect
         displayLayer.backgroundColor = UIColor.black.cgColor
     }
@@ -31,15 +42,13 @@ final class VideoRenderer {
     /// New connection: forget stream state and clear the picture.
     func reset() {
         lock.lock()
+        defer { lock.unlock() }
         sps = nil
         pps = nil
         formatDescription = nil
         needsKeyframe = true
         deliveredFirstFrame = false
-        lock.unlock()
-        DispatchQueue.main.async { [displayLayer] in
-            displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
-        }
+        renderer.flush(removingDisplayedImage: true, completionHandler: nil)
     }
 
     /// (frames, bytes) since the last call.
@@ -49,59 +58,131 @@ final class VideoRenderer {
         return (statFrames, statBytes)
     }
 
-    /// Called on the network thread with one access unit: repeated [u32 big-endian length][NAL].
-    func handleAccessUnit(_ payload: Data) {
+    /// Reader thread. `block` holds one Video message (protocol v2: [u32 LE frame id] first).
+    /// Returns the frame id to acknowledge - also for frames that couldn't be shown, so the host's
+    /// pacing never stalls waiting for them.
+    @discardableResult
+    func handleVideo(_ block: CMBlockBuffer, length: Int, hasFrameId: Bool) -> UInt32? {
+        var raw: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                          totalLengthOut: nil, dataPointerOut: &raw) == kCMBlockBufferNoErr,
+              let raw else { return nil }
+        let base = UnsafeRawPointer(raw)
+
         lock.lock()
         defer { lock.unlock() }
         statFrames += 1
-        statBytes += payload.count
+        statBytes += length
 
-        var sample = Data()
-        var isKeyframe = false
-        var parameterSetsChanged = false
+        var o = 0
+        var frameId: UInt32?
+        if hasFrameId {
+            guard length >= 4 else { return nil }
+            frameId = UInt32(littleEndian: base.loadUnaligned(as: UInt32.self))
+            o = 4
+        }
 
-        payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            let p = raw.bindMemory(to: UInt8.self)
-            guard let base = p.baseAddress else { return }
-            var o = 0
-            while o + 4 <= p.count {
-                let n = Int(p[o]) << 24 | Int(p[o + 1]) << 16 | Int(p[o + 2]) << 8 | Int(p[o + 3])
-                o += 4
-                guard n > 0, o + n <= p.count else { break }
-                let type = p[o] & 0x1F
-                switch type {
-                case 7:
-                    let nal = Data(bytes: base + o, count: n)
-                    if nal != sps { sps = nal; parameterSetsChanged = true }
-                case 8:
-                    let nal = Data(bytes: base + o, count: n)
-                    if nal != pps { pps = nal; parameterSetsChanged = true }
-                case 9:
-                    break // access unit delimiter: not needed
-                default:
-                    if type == 5 { isKeyframe = true }
-                    var len = UInt32(n).bigEndian
-                    withUnsafeBytes(of: &len) { sample.append(contentsOf: $0) }
-                    sample.append(base + o, count: n)
-                }
-                o += n
+        // Walk the NAL units in place. The picture (slices + SEI) normally follows the parameter sets
+        // as one contiguous run: [SPS][PPS][SEI][IDR...] - that run becomes the sample, by reference.
+        var pictureStart = -1, pictureEnd = -1
+        var contiguous = true, isKeyframe = false, parameterSetsChanged = false
+        while o + 4 <= length {
+            let n = Int(UInt32(bigEndian: base.loadUnaligned(fromByteOffset: o, as: UInt32.self)))
+            guard n > 0, o + 4 + n <= length else { break }
+            let nal = base + o + 4
+            switch nal.load(as: UInt8.self) & 0x1F {
+            case 7:
+                if Self.differs(sps, nal, n) { sps = Data(bytes: nal, count: n); parameterSetsChanged = true }
+            case 8:
+                if Self.differs(pps, nal, n) { pps = Data(bytes: nal, count: n); parameterSetsChanged = true }
+            case 9:
+                break // access unit delimiter: not part of the sample
+            case let type:
+                if type == 5 { isKeyframe = true }
+                if pictureStart < 0 { pictureStart = o } else if o != pictureEnd { contiguous = false }
+                pictureEnd = o + 4 + n
             }
+            o += 4 + n
         }
 
         if parameterSetsChanged { rebuildFormatDescription() }
-        guard let fd = formatDescription, !sample.isEmpty else { return }
+        guard let format = formatDescription, pictureStart >= 0 else { return frameId }
         if needsKeyframe {
-            guard isKeyframe else { return } // can't decode until the next keyframe
+            guard isKeyframe else { return frameId } // can't decode until the next keyframe
             needsKeyframe = false
         }
-        guard let sampleBuffer = makeSampleBuffer(sample, fd) else { return }
 
-        let first = !deliveredFirstFrame
-        deliveredFirstFrame = true
-        DispatchQueue.main.async { [weak self] in
-            self?.enqueue(sampleBuffer)
-            if first { self?.onFirstFrame?() }
+        let sampleData = contiguous
+            ? Self.reference(block, offset: pictureStart, length: pictureEnd - pictureStart)
+            : Self.gatherPicture(base, from: pictureStart, to: length)
+        guard let sampleData, let sampleBuffer = Self.makeSampleBuffer(sampleData, format) else { return frameId }
+
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+            // Decoder lost state (e.g. the app was in the background): restart at the next keyframe.
+            renderer.flush()
+            needsKeyframe = true
+            return frameId
         }
+        renderer.enqueue(sampleBuffer)
+
+        if !deliveredFirstFrame {
+            deliveredFirstFrame = true
+            DispatchQueue.main.async { [weak self] in self?.onFirstFrame?() }
+        }
+        return frameId
+    }
+
+    // MARK: - Helpers
+
+    private static func differs(_ stored: Data?, _ bytes: UnsafeRawPointer, _ count: Int) -> Bool {
+        guard let stored, stored.count == count else { return true }
+        return stored.withUnsafeBytes { memcmp($0.baseAddress!, bytes, count) != 0 }
+    }
+
+    /// A block buffer that refers to part of `block` - no copy; it keeps `block` alive.
+    private static func reference(_ block: CMBlockBuffer, offset: Int, length: Int) -> CMBlockBuffer? {
+        var sub: CMBlockBuffer?
+        let status = CMBlockBufferCreateWithBufferReference(
+            allocator: kCFAllocatorDefault, referenceBuffer: block,
+            offsetToData: offset, dataLength: length, flags: 0, blockBufferOut: &sub)
+        return status == kCMBlockBufferNoErr ? sub : nil
+    }
+
+    /// Fallback when parameter sets or delimiters sit between slices: copy just the picture NALs.
+    private static func gatherPicture(_ base: UnsafeRawPointer, from start: Int, to end: Int) -> CMBlockBuffer? {
+        var total = 0
+        var o = start
+        while o + 4 <= end {
+            let n = Int(UInt32(bigEndian: base.loadUnaligned(fromByteOffset: o, as: UInt32.self)))
+            guard n > 0, o + 4 + n <= end else { break }
+            let type = base.load(fromByteOffset: o + 4, as: UInt8.self) & 0x1F
+            if type != 7 && type != 8 && type != 9 { total += 4 + n }
+            o += 4 + n
+        }
+        guard total > 0 else { return nil }
+
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: total,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: total,
+            flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block) == kCMBlockBufferNoErr,
+              let block else { return nil }
+
+        var written = 0
+        o = start
+        while o + 4 <= end {
+            let n = Int(UInt32(bigEndian: base.loadUnaligned(fromByteOffset: o, as: UInt32.self)))
+            guard n > 0, o + 4 + n <= end else { break }
+            let type = base.load(fromByteOffset: o + 4, as: UInt8.self) & 0x1F
+            if type != 7 && type != 8 && type != 9 {
+                guard CMBlockBufferReplaceDataBytes(with: base + o, blockBuffer: block,
+                                                    offsetIntoDestination: written, dataLength: 4 + n) == kCMBlockBufferNoErr
+                else { return nil }
+                written += 4 + n
+            }
+            o += 4 + n
+        }
+        return block
     }
 
     // Must hold `lock`.
@@ -136,28 +217,18 @@ final class VideoRenderer {
         }
     }
 
-    private func makeSampleBuffer(_ data: Data, _ format: CMVideoFormatDescription) -> CMSampleBuffer? {
-        var block: CMBlockBuffer?
-        var status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: data.count,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-            offsetToData: 0, dataLength: data.count, flags: 0, blockBufferOut: &block)
-        guard status == kCMBlockBufferNoErr, let block else { return nil }
-
-        status = data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> OSStatus in
-            CMBlockBufferReplaceDataBytes(with: buf.baseAddress!, blockBuffer: block,
-                                          offsetIntoDestination: 0, dataLength: data.count)
-        }
-        guard status == kCMBlockBufferNoErr else { return nil }
-
+    /// One sample, no timing: with DisplayImmediately the layer shows it at the next refresh.
+    private static func makeSampleBuffer(_ data: CMBlockBuffer, _ format: CMVideoFormatDescription) -> CMSampleBuffer? {
         var sampleBuffer: CMSampleBuffer?
-        var sampleSize = data.count
-        status = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
+        var sampleSize = CMBlockBufferGetDataLength(data)
+        let status = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault, dataBuffer: data, formatDescription: format,
             sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sampleBuffer)
         guard status == noErr, let sampleBuffer else { return nil }
 
+        // Per-sample attachment (kCMSampleAttachmentKey_*), not a buffer-level one
+        // (kCMSampleBufferAttachmentKey_*): this is the key the renderer honours per frame.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
            CFArrayGetCount(attachments) > 0 {
             let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
@@ -166,19 +237,5 @@ final class VideoRenderer {
                                  Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
         return sampleBuffer
-    }
-
-    // Main thread.
-    private func enqueue(_ sampleBuffer: CMSampleBuffer) {
-        let renderer = displayLayer.sampleBufferRenderer
-        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
-            // Decoder lost state (e.g. app was in the background): restart at the next keyframe.
-            renderer.flush()
-            lock.lock()
-            needsKeyframe = true
-            lock.unlock()
-            return
-        }
-        renderer.enqueue(sampleBuffer)
     }
 }

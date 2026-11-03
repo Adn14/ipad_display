@@ -63,20 +63,37 @@ final class StreamController {
         return hostName
     }
 
+    /// Per-connection state touched only on that connection's reader thread.
+    private final class Link {
+        var hostProtocol = 1
+    }
+
     private func accept(_ fd: Int32) {
         let conn = ClientConnection(fd: fd)
+        let link = Link()
         lock.lock()
         let previous = connection
         connection = conn
         hostName = "laptop"
-        let hello = helloPayload
+        var hello = helloPayload
         lock.unlock()
+        hello["proto"] = AppConfig.protocolVersion
+        hello["acks"] = true // we acknowledge frames, so the host can pace the stream
 
         previous?.disconnect() // newest host wins
         renderer.reset()
 
+        conn.onVideo = { [weak self, weak conn] block, length in
+            guard let self else { return }
+            let frameId = self.renderer.handleVideo(block, length: length, hasFrameId: link.hostProtocol >= 2)
+            if let frameId, let conn {
+                var ack = ByteBuffer()
+                ack.u32(frameId)
+                conn.send(Message.frame(.frameAck, ack.data))
+            }
+        }
         conn.onMessage = { [weak self] type, payload in
-            self?.handle(type: type, payload: payload)
+            self?.handle(type: type, payload: payload, link: link)
         }
         conn.onClose = { [weak self, weak conn] in
             guard let self else { return }
@@ -94,30 +111,34 @@ final class StreamController {
         conn.send(Message.json(.clientHello, hello))
     }
 
-    // Reader thread.
-    private func handle(type: UInt8, payload: Data) {
+    // Reader thread. `payload` is borrowed: valid only during this call.
+    private func handle(type: UInt8, payload: UnsafeRawBufferPointer, link: Link) {
         switch MsgType(rawValue: type) {
-        case .video:
-            renderer.handleAccessUnit(payload)
         case .audio:
             audio.enqueue(payload)
         case .audioFormat:
-            let obj = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] ?? [:]
+            let obj = Self.json(payload)
             let rate = (obj["sampleRate"] as? NSNumber)?.doubleValue ?? 48000
             let channels = (obj["channels"] as? NSNumber)?.intValue ?? 2
             audio.configure(sampleRate: rate, channels: channels)
         case .hostHello:
-            let obj = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] ?? [:]
+            let obj = Self.json(payload)
             let name = obj["name"] as? String ?? "laptop"
+            link.hostProtocol = (obj["proto"] as? NSNumber)?.intValue ?? 1
             lock.lock()
             hostName = name
             lock.unlock()
             DispatchQueue.main.async { [weak self] in self?.onStateChange?(.connected(host: name)) }
         case .hostInfo:
-            let obj = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] ?? [:]
+            let obj = Self.json(payload)
             DispatchQueue.main.async { [weak self] in self?.onHostInfo?(obj) }
         default:
             break
         }
+    }
+
+    /// Control messages are rare and small; copying them out is fine.
+    private static func json(_ payload: UnsafeRawBufferPointer) -> [String: Any] {
+        (try? JSONSerialization.jsonObject(with: Data(payload))) as? [String: Any] ?? [:]
     }
 }

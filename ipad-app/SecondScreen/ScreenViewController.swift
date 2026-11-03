@@ -9,6 +9,7 @@ final class ScreenViewController: UIViewController {
     private var stream: StreamController!
     private var input: InputController!
     private var statsTimer: Timer?
+    private let refreshBooster = RefreshRateBooster()
     private var encoderName = ""
     private var videoSize = CGSize.zero
     private var state: StreamController.State = .waiting
@@ -130,6 +131,11 @@ final class ScreenViewController: UIViewController {
 
     private func apply(state newState: StreamController.State) {
         state = newState
+        if case .streaming = newState {
+            refreshBooster.start(maxFramesPerSecond: view.window?.windowScene?.screen.maximumFramesPerSecond ?? 120)
+        } else {
+            refreshBooster.stop()
+        }
         switch newState {
         case .waiting:
             input.cancelAll()

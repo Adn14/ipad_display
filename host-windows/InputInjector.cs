@@ -29,8 +29,29 @@ internal sealed class InputInjector : IDisposable
 
     public InputInjector()
     {
+        if (!LayoutOk)
+            Log.Error("Win32 input structures have an unexpected layout on this system; touch/pen/mouse injection is disabled.");
         _keepAlive = new Timer(_ => KeepAlive(), null, 50, 50);
     }
+
+    /// <summary>
+    /// Guards against a mis-declared struct silently injecting garbage: sizes and key offsets must match
+    /// the x64 Windows SDK layout (winuser.h), or injection stays off.
+    /// </summary>
+    private static readonly bool LayoutOk =
+        Environment.Is64BitProcess
+        && Marshal.SizeOf<POINTER_INFO>() == 96
+        && Marshal.OffsetOf<POINTER_INFO>(nameof(POINTER_INFO.sourceDevice)) == 16
+        && Marshal.OffsetOf<POINTER_INFO>(nameof(POINTER_INFO.ptPixelLocation)) == 32
+        && Marshal.OffsetOf<POINTER_INFO>(nameof(POINTER_INFO.PerformanceCount)) == 80
+        && Marshal.SizeOf<POINTER_TOUCH_INFO>() == 144
+        && Marshal.OffsetOf<POINTER_TOUCH_INFO>(nameof(POINTER_TOUCH_INFO.pressure)) == 140
+        && Marshal.SizeOf<POINTER_PEN_INFO>() == 120
+        && Marshal.OffsetOf<POINTER_PEN_INFO>(nameof(POINTER_PEN_INFO.tiltY)) == 116
+        && Marshal.SizeOf<POINTER_TYPE_INFO>() == 152
+        && Marshal.OffsetOf<POINTER_TYPE_INFO>(nameof(POINTER_TYPE_INFO.touchInfo)) == 8
+        && Marshal.SizeOf<MOUSEINPUT>() == 32
+        && Marshal.SizeOf<INPUT>() == 40;
 
     public void SetMonitor(MonitorInfo mon)
     {
@@ -43,7 +64,7 @@ internal sealed class InputInjector : IDisposable
     {
         lock (_lock)
         {
-            if (_mon is null || points.Length == 0) return;
+            if (!LayoutOk || _mon is null || points.Length == 0) return;
             if (_touchDevice == IntPtr.Zero)
             {
                 _touchDevice = CreateSyntheticPointerDevice(PT_TOUCH, MaxTouches, POINTER_FEEDBACK_DEFAULT);
@@ -135,7 +156,7 @@ internal sealed class InputInjector : IDisposable
     {
         lock (_lock)
         {
-            if (_mon is null) return;
+            if (!LayoutOk || _mon is null) return;
             if (_penDevice == IntPtr.Zero)
             {
                 _penDevice = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT);
@@ -189,7 +210,7 @@ internal sealed class InputInjector : IDisposable
     {
         lock (_lock)
         {
-            if (_mon is null) return;
+            if (!LayoutOk || _mon is null) return;
             var (x, y) = ToScreen(nx, ny);
             switch (action)
             {

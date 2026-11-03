@@ -16,6 +16,11 @@ final class AudioPlayer {
     private var startFrames = 0     // small cushion before starting, against network jitter
     private var lastConsumed = CACurrentMediaTime()
 
+    // Snapshot for the network thread, which converts samples without hopping onto `queue` first.
+    private let stateLock = NSLock()
+    private var currentFormat: AVAudioFormat?
+    private var currentlyEnabled = true
+
     init() {
         engine.attach(player)
         NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
@@ -29,6 +34,9 @@ final class AudioPlayer {
     }
 
     func setEnabled(_ on: Bool) {
+        stateLock.lock()
+        currentlyEnabled = on
+        stateLock.unlock()
         queue.async { [self] in
             enabled = on
             if !on { resetPlayback() }
@@ -45,58 +53,69 @@ final class AudioPlayer {
             engine.disconnectNodeOutput(player)
             engine.connect(player, to: engine.mainMixerNode, format: fmt)
             format = fmt
+            stateLock.lock()
+            currentFormat = fmt
+            stateLock.unlock()
             maxQueuedFrames = Int(sampleRate * 0.12)
             startFrames = Int(sampleRate * 0.03)
         }
     }
 
-    /// Network thread: one chunk of interleaved little-endian Int16 samples.
-    func enqueue(_ pcm: Data) {
-        queue.async { [self] in
-            guard enabled, let fmt = format else { return }
-            let channels = Int(fmt.channelCount)
-            let frames = pcm.count / (2 * channels)
-            guard frames > 0 else { return }
-            if queuedFrames > maxQueuedFrames {
-                // Normally: we're behind, so drop this chunk to catch up. But if nothing has been played
-                // for a while, the output stalled (e.g. iPadOS paused our audio): reset instead of
-                // dropping forever.
-                if CACurrentMediaTime() - lastConsumed < 0.5 { return }
-                resetPlayback()
-                engine.stop()
-            }
+    /// Network thread: one chunk of interleaved little-endian Int16 samples. The bytes are borrowed
+    /// (valid only during the call), so they're converted into the player's own buffer right here -
+    /// the single copy - and only that buffer is handed to the audio queue.
+    func enqueue(_ pcm: UnsafeRawBufferPointer) {
+        stateLock.lock()
+        let fmt = currentFormat
+        let on = currentlyEnabled
+        stateLock.unlock()
+        guard on, let fmt else { return }
 
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frames)),
-                  let out = buffer.floatChannelData else { return }
-            buffer.frameLength = AVAudioFrameCount(frames)
-            pcm.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                for f in 0..<frames {
-                    for c in 0..<channels {
-                        let sample = raw.loadUnaligned(fromByteOffset: (f * channels + c) * 2, as: Int16.self)
-                        out[c][f] = Float(Int16(littleEndian: sample)) / 32768
-                    }
-                }
+        let channels = Int(fmt.channelCount)
+        let frames = pcm.count / (2 * channels)
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frames)),
+              let out = buffer.floatChannelData else { return }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        for f in 0..<frames {
+            for c in 0..<channels {
+                let sample = pcm.loadUnaligned(fromByteOffset: (f * channels + c) * 2, as: Int16.self)
+                out[c][f] = Float(Int16(littleEndian: sample)) / 32768
             }
-
-            if !engine.isRunning {
-                let session = AVAudioSession.sharedInstance()
-                try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-                try? session.setPreferredIOBufferDuration(0.005)
-                try? session.setActive(true)
-                do { try engine.start() } catch { return }
-            }
-
-            let gen = generation
-            queuedFrames += frames
-            player.scheduleBuffer(buffer, completionCallbackType: .dataConsumed) { [weak self] _ in
-                self?.queue.async {
-                    guard let self, self.generation == gen else { return }
-                    self.queuedFrames = max(0, self.queuedFrames - frames)
-                    self.lastConsumed = CACurrentMediaTime()
-                }
-            }
-            if !player.isPlaying && queuedFrames >= startFrames { player.play() }
         }
+        queue.async { [self] in schedule(buffer, frames: frames, format: fmt) }
+    }
+
+    // Must run on `queue`.
+    private func schedule(_ buffer: AVAudioPCMBuffer, frames: Int, format fmt: AVAudioFormat) {
+        guard enabled, format === fmt else { return } // format changed while converting: stale chunk
+        if queuedFrames > maxQueuedFrames {
+            // Normally: we're behind, so drop this chunk to catch up. But if nothing has been played
+            // for a while, the output stalled (e.g. iPadOS paused our audio): reset instead of
+            // dropping forever.
+            if CACurrentMediaTime() - lastConsumed < 0.5 { return }
+            resetPlayback()
+            engine.stop()
+        }
+
+        if !engine.isRunning {
+            let session = AVAudioSession.sharedInstance()
+            try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try? session.setPreferredIOBufferDuration(0.005)
+            try? session.setActive(true)
+            do { try engine.start() } catch { return }
+        }
+
+        let gen = generation
+        queuedFrames += frames
+        player.scheduleBuffer(buffer, completionCallbackType: .dataConsumed) { [weak self] _ in
+            self?.queue.async {
+                guard let self, self.generation == gen else { return }
+                self.queuedFrames = max(0, self.queuedFrames - frames)
+                self.lastConsumed = CACurrentMediaTime()
+            }
+        }
+        if !player.isPlaying && queuedFrames >= startFrames { player.play() }
     }
 
     /// Connection ended.

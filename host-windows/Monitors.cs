@@ -9,7 +9,8 @@ internal sealed record MonitorInfo(
     string FriendlyName,    // monitor name from the driver, e.g. "VDD by MTT"
     int Left, int Top, int Width, int Height,   // physical pixels, virtual-desktop coordinates
     int AdapterIndex, int OutputIndex,
-    uint VendorId, string AdapterName)
+    uint VendorId, string AdapterName,
+    int RefreshHz)
 {
     public bool IsPrimary => Left == 0 && Top == 0;
     public int Right => Left + Width;
@@ -24,7 +25,7 @@ internal sealed record MonitorInfo(
     };
 
     public override string ToString() =>
-        $"[{Index}] {DeviceName}  {Width}x{Height} at ({Left},{Top})  \"{FriendlyName}\"{(IsPrimary ? "  (primary)" : "")}  on {AdapterName}";
+        $"[{Index}] {DeviceName}  {Width}x{Height} @ {RefreshHz} Hz at ({Left},{Top})  \"{FriendlyName}\"{(IsPrimary ? "  (primary)" : "")}  on {AdapterName}";
 }
 
 internal static unsafe class Monitors
@@ -95,7 +96,7 @@ internal static unsafe class Monitors
                             var r = od.DesktopCoordinates;
                             result.Add(new MonitorInfo(result.Count, dev, FriendlyName(dev),
                                 r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top,
-                                (int)a, (int)o, ad.VendorId, adapterName));
+                                (int)a, (int)o, ad.VendorId, adapterName, RefreshRate(dev)));
                         }
                         finally { Release(output); }
                     }
@@ -125,6 +126,14 @@ internal static unsafe class Monitors
             }
         }
         finally { Release(factory); }
+    }
+
+    private static int RefreshRate(string deviceName)
+    {
+        var dm = new Native.DEVMODEW { dmSize = (ushort)Marshal.SizeOf<Native.DEVMODEW>() };
+        return Native.EnumDisplaySettingsW(deviceName, Native.ENUM_CURRENT_SETTINGS, ref dm) && dm.dmDisplayFrequency > 1
+            ? (int)dm.dmDisplayFrequency
+            : 60;
     }
 
     private static string FriendlyName(string deviceName)

@@ -1,6 +1,6 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
-using System.Text;
 using System.Text.Json;
 
 namespace IPadScreenHost;
@@ -11,16 +11,26 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
     private static string? _workingEncoder; // remembered across reconnects
     private readonly object _writeLock = new();
     private readonly CancellationTokenSource _cts = new();
+    private readonly ManualResetEventSlim _helloReceived = new();
+    private readonly FramePacer _pacer = new(opt.MaxInFlight);
+    // Reusable serialization buffers: grow to the largest message once, then no per-frame allocation.
+    private readonly ArrayBufferWriter<byte> _videoOut = new(1 << 20); // video thread only
+    private readonly ArrayBufferWriter<byte> _audioOut = new(16 << 10); // audio capture thread only
+    private volatile int _clientProto = 1;
     private long _bytesSent;
+    private long _lastAuTimestamp, _maxAuGap; // video thread; stats only
+
+    private int Fps => opt.Fps > 0 ? opt.Fps : Math.Clamp(monitor.RefreshHz, 24, 120);
 
     public void Run(CancellationToken outer)
     {
         using var reg = outer.Register(_cts.Cancel);
         input.SetMonitor(monitor);
 
-        SendJson(Msg.HostHello, new { proto = 1, width = monitor.Width, height = monitor.Height, name = Environment.MachineName });
+        SendJson(Msg.HostHello, new { proto = Msg.ProtocolVersion, width = monitor.Width, height = monitor.Height, name = Environment.MachineName });
 
-        var reader = new Thread(ReadLoop) { IsBackground = true, Name = "ipad-reader" };
+        // Input from the iPad: injected inline on this thread (no hand-off queue to add latency).
+        var reader = new Thread(ReadLoop) { IsBackground = true, Name = "ipad-input", Priority = ThreadPriority.Highest };
         reader.Start();
 
         AudioStreamer? audio = opt.NoAudio ? null : StartAudio();
@@ -35,6 +45,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             input.ReleaseAll();
             try { stream.Dispose(); } catch { }
             reader.Join(1000);
+            _helloReceived.Dispose();
         }
     }
 
@@ -46,15 +57,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
     {
         try
         {
-            var streamer = AudioStreamer.TryCreate(opt.AudioDevice, pcm =>
-            {
-                if (_cts.IsCancellationRequested) return;
-                var msg = new byte[5 + pcm.Length];
-                msg[0] = Msg.Audio;
-                BinaryPrimitives.WriteUInt32LittleEndian(msg.AsSpan(1), (uint)pcm.Length);
-                pcm.CopyTo(msg, 5);
-                Write(msg);
-            });
+            var streamer = AudioStreamer.TryCreate(opt.AudioDevice, SendAudio);
             if (streamer is null)
             {
                 if (!_warnedNoAudioDevice)
@@ -78,25 +81,44 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
         }
     }
 
+    private void SendAudio(ReadOnlySpan<byte> pcm)
+    {
+        if (_cts.IsCancellationRequested) return;
+        var w = _audioOut;
+        w.ResetWrittenCount();
+        Wire.WriteHeader(w, Msg.Audio, pcm.Length);
+        Wire.Write(w, pcm);
+        Write(w.WrittenSpan);
+    }
+
     // ------------------------------------------------------------------ video
 
     private void StreamVideo()
     {
+        // The video format depends on the app's protocol version, so wait (briefly) for its hello.
+        try
+        {
+            if (!_helloReceived.Wait(TimeSpan.FromSeconds(2), _cts.Token))
+                Log.Warn("The iPad app didn't introduce itself; assuming an old version (no frame pacing).");
+        }
+        catch (OperationCanceledException) { return; }
+
         var candidates = _workingEncoder is { } w ? new List<string> { w } : FfmpegEncoder.Candidates(monitor, opt.Encoder);
         int restarts = 0;
 
         for (int i = 0; i < candidates.Count && !_cts.IsCancellationRequested;)
         {
             string name = candidates[i];
-            using var enc = new FfmpegEncoder(ffmpeg, name, monitor, opt.Fps, opt.BitrateMbps, SendAccessUnit);
+            int fps = Fps;
+            using var enc = new FfmpegEncoder(ffmpeg, name, monitor, fps, opt.BitrateMbps, SendAccessUnit);
 
             // Wait for the first picture; if ffmpeg dies first, this encoder doesn't work here.
             var sw = Stopwatch.StartNew();
-            while (!_cts.IsCancellationRequested && enc.AccessUnits == 0 && !enc.HasExited && sw.Elapsed < TimeSpan.FromSeconds(8))
+            while (!_cts.IsCancellationRequested && Interlocked.Read(ref enc.AccessUnits) == 0 && !enc.HasExited && sw.Elapsed < TimeSpan.FromSeconds(8))
                 Thread.Sleep(20);
             if (_cts.IsCancellationRequested) return;
 
-            if (enc.AccessUnits == 0)
+            if (Interlocked.Read(ref enc.AccessUnits) == 0)
             {
                 Thread.Sleep(200); // let stderr drain
                 Log.Warn($"Encoder '{name}' ({enc.Codec}) failed to start:\n    {enc.StderrTail}");
@@ -105,14 +127,15 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                 continue;
             }
 
-            if (_workingEncoder != name) Log.Info($"Encoder: {name} ({enc.Codec}), {monitor.Width}x{monitor.Height} @ {opt.Fps} fps, {opt.BitrateMbps} Mbps");
+            Log.Info($"Encoder: {name} ({enc.Codec}), {monitor.Width}x{monitor.Height} @ {fps} fps, {opt.BitrateMbps} Mbps" +
+                     (_pacer.Enabled ? $", pacing at {opt.MaxInFlight} frames in flight" : ""));
             _workingEncoder = name;
             SendJson(Msg.HostInfo, new { encoder = enc.Codec });
 
             // Stream until the iPad disconnects or ffmpeg exits (e.g. display mode changed).
             var statsTimer = Stopwatch.StartNew();
             var geometryTimer = Stopwatch.StartNew();
-            long lastBytes = 0, lastAus = 0;
+            long lastBytes = 0, lastAus = 0, lastDropped = _pacer.Dropped;
             bool resized = false;
             while (!_cts.IsCancellationRequested && !enc.HasExited)
             {
@@ -126,10 +149,12 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                 }
                 if (opt.Verbose && statsTimer.ElapsedMilliseconds >= 5000)
                 {
-                    long b = Interlocked.Read(ref _bytesSent), a = Interlocked.Read(ref enc.AccessUnits);
+                    long b = Interlocked.Read(ref _bytesSent), a = Interlocked.Read(ref enc.AccessUnits), d = _pacer.Dropped;
                     double secs = statsTimer.Elapsed.TotalSeconds;
-                    Log.Debug($"{(a - lastAus) / secs:F1} fps, {(b - lastBytes) * 8 / secs / 1e6:F1} Mbps");
-                    lastBytes = b; lastAus = a;
+                    double maxGapMs = Interlocked.Exchange(ref _maxAuGap, 0) * 1000.0 / Stopwatch.Frequency;
+                    Log.Debug($"{(a - lastAus) / secs:F1} fps encoded (max gap {maxGapMs:F0} ms), {(b - lastBytes) * 8 / secs / 1e6:F1} Mbps" +
+                              (_pacer.Enabled ? $", {(d - lastDropped) / secs:F1} dropped/s, {_pacer.InFlight} in flight" : ""));
+                    lastBytes = b; lastAus = a; lastDropped = d;
                     statsTimer.Restart();
                 }
             }
@@ -143,7 +168,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             }
             if (resized)
             {
-                Log.Info($"{monitor.DeviceName} is now {monitor.Width}x{monitor.Height}; restarting video.");
+                Log.Info($"{monitor.DeviceName} is now {monitor.Width}x{monitor.Height} @ {monitor.RefreshHz} Hz; restarting video.");
                 Thread.Sleep(300);
                 continue; // new encoder at the new size (the using disposes the old one)
             }
@@ -161,8 +186,8 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
     private enum GeometryChange { None, Moved, Resized, Gone }
 
     /// <summary>
-    /// Re-reads the streamed monitor's position and size. Touch input must map onto the monitor's
-    /// *current* rectangle: changing resolution or rearranging displays while connected would
+    /// Re-reads the streamed monitor's position, size and refresh rate. Touch input must map onto the
+    /// monitor's *current* rectangle: changing resolution or rearranging displays while connected would
     /// otherwise make every touch land in the wrong place.
     /// </summary>
     private GeometryChange RefreshMonitor()
@@ -174,51 +199,63 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             return GeometryChange.Gone;
         }
         if (now.Left == monitor.Left && now.Top == monitor.Top && now.Width == monitor.Width && now.Height == monitor.Height
-            && now.OutputIndex == monitor.OutputIndex && now.VendorId == monitor.VendorId)
+            && now.OutputIndex == monitor.OutputIndex && now.VendorId == monitor.VendorId && now.RefreshHz == monitor.RefreshHz)
             return GeometryChange.None;
 
-        bool resized = now.Width != monitor.Width || now.Height != monitor.Height
-                       || now.OutputIndex != monitor.OutputIndex || now.VendorId != monitor.VendorId;
+        bool restartVideo = now.Width != monitor.Width || now.Height != monitor.Height
+                            || now.OutputIndex != monitor.OutputIndex || now.VendorId != monitor.VendorId
+                            || (opt.Fps == 0 && now.RefreshHz != monitor.RefreshHz);
         monitor = now;
         input.SetMonitor(now);
-        Log.Debug($"{now.DeviceName} geometry: {now.Width}x{now.Height} at ({now.Left},{now.Top})");
-        return resized ? GeometryChange.Resized : GeometryChange.Moved;
+        Log.Debug($"{now.DeviceName} geometry: {now.Width}x{now.Height} @ {now.RefreshHz} Hz at ({now.Left},{now.Top})");
+        return restartVideo ? GeometryChange.Resized : GeometryChange.Moved;
     }
 
-    private void SendAccessUnit(List<ArraySegment<byte>> nals)
+    /// <summary>
+    /// Video thread (inline from the pipe). Decides whether the picture goes out, then serializes it
+    /// straight from the pipe's buffer into the reusable writer: the only copy on the host side.
+    /// </summary>
+    private void SendAccessUnit(in AccessUnit au)
     {
         if (_cts.IsCancellationRequested) return;
-        int size = 0;
-        foreach (var n in nals) size += 4 + n.Count;
-        var msg = new byte[5 + size];
-        msg[0] = Msg.Video;
-        BinaryPrimitives.WriteUInt32LittleEndian(msg.AsSpan(1), (uint)size);
-        int o = 5;
-        foreach (var n in nals)
+        long now = Stopwatch.GetTimestamp();
+        if (_lastAuTimestamp != 0)
         {
-            BinaryPrimitives.WriteUInt32BigEndian(msg.AsSpan(o), (uint)n.Count);
-            n.AsSpan().CopyTo(msg.AsSpan(o + 4));
-            o += 4 + n.Count;
+            long gap = now - _lastAuTimestamp;
+            if (gap > _maxAuGap) _maxAuGap = gap; // read (racily, for stats only) by the stats loop
         }
-        Write(msg);
+        _lastAuTimestamp = now;
+        if (!_pacer.TryAdmit(in au, out uint frameId)) return; // dropped before it touches the socket
+
+        bool withFrameId = _clientProto >= 2;
+        var w = _videoOut;
+        w.ResetWrittenCount();
+        Wire.WriteHeader(w, Msg.Video, (withFrameId ? 4 : 0) + au.AvccLength);
+        if (withFrameId) Wire.WriteUInt32LittleEndian(w, frameId);
+        foreach (var nal in au.Nals)
+        {
+            Wire.WriteUInt32BigEndian(w, (uint)nal.Length);
+            Wire.Write(w, au.Buffer.Slice(nal.Start, nal.Length));
+        }
+        Write(w.WrittenSpan);
     }
 
+    /// <summary>Rare control messages; allocation is fine here.</summary>
     private void SendJson(byte type, object payload)
     {
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(payload);
-        var msg = new byte[5 + json.Length];
-        msg[0] = type;
-        BinaryPrimitives.WriteUInt32LittleEndian(msg.AsSpan(1), (uint)json.Length);
-        json.CopyTo(msg, 5);
-        Write(msg);
+        var w = new ArrayBufferWriter<byte>(Msg.HeaderSize + json.Length);
+        Wire.WriteHeader(w, type, json.Length);
+        Wire.Write(w, json);
+        Write(w.WrittenSpan);
     }
 
-    private void Write(byte[] msg)
+    private void Write(ReadOnlySpan<byte> message)
     {
         try
         {
-            lock (_writeLock) stream.Write(msg);
-            Interlocked.Add(ref _bytesSent, msg.Length);
+            lock (_writeLock) stream.Write(message);
+            Interlocked.Add(ref _bytesSent, message.Length);
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException)
         {
@@ -231,7 +268,8 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
 
     private void ReadLoop()
     {
-        var header = new byte[5];
+        using var mmcss = MmcssScope.Enter("Games");
+        Span<byte> header = stackalloc byte[Msg.HeaderSize];
         var payload = new byte[4096];
         var touches = new TouchPoint[16];
         try
@@ -239,19 +277,22 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             while (!_cts.IsCancellationRequested)
             {
                 stream.ReadExactly(header);
-                int len = (int)BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(1));
+                int len = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(1));
                 if (len < 0 || len > Msg.MaxPayload) throw new InvalidDataException($"bad message length {len}");
                 if (payload.Length < len) payload = new byte[len];
                 stream.ReadExactly(payload, 0, len);
                 var p = payload.AsSpan(0, len);
-                if (opt.NoInput && header[0] != Msg.ClientHello) continue;
+                byte type = header[0];
 
-                switch (header[0])
+                switch (type)
                 {
                     case Msg.ClientHello:
                         HandleHello(p);
                         break;
-                    case Msg.Touch when len >= 1:
+                    case Msg.FrameAck when len >= 4:
+                        _pacer.Ack(BinaryPrimitives.ReadUInt32LittleEndian(p));
+                        break;
+                    case Msg.Touch when len >= 1 && !opt.NoInput:
                     {
                         int count = Math.Min(p[0], touches.Length);
                         int n = 0;
@@ -263,14 +304,16 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                         input.TouchFrame(touches.AsSpan(0, n));
                         break;
                     }
-                    case Msg.Pen when len >= 21:
+                    case Msg.Pen when len >= 21 && !opt.NoInput:
                         input.Pen((TouchPhase)p[0], F(p, 1), F(p, 5), F(p, 9), F(p, 13), F(p, 17));
                         break;
-                    case Msg.Mouse when len >= 17:
+                    case Msg.Mouse when len >= 17 && !opt.NoInput:
                         input.Mouse((MouseAction)p[0], F(p, 1), F(p, 5), F(p, 9), F(p, 13));
                         break;
+                    case Msg.Touch or Msg.Pen or Msg.Mouse:
+                        break; // --no-input, or truncated
                     default:
-                        Log.Debug($"ignoring message 0x{header[0]:X2} ({len} bytes)");
+                        Log.Debug($"ignoring message 0x{type:X2} ({len} bytes)");
                         break;
                 }
             }
@@ -291,12 +334,19 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
     {
         try
         {
-            using var doc = JsonDocument.Parse(json.ToArray());
+            var reader = new Utf8JsonReader(json);
+            using var doc = JsonDocument.ParseValue(ref reader);
             var r = doc.RootElement;
             int w = r.TryGetProperty("widthPx", out var wp) ? wp.GetInt32() : 0;
             int h = r.TryGetProperty("heightPx", out var hp) ? hp.GetInt32() : 0;
             string dev = r.TryGetProperty("device", out var dp) ? dp.GetString() ?? "iPad" : "iPad";
-            Log.Info($"Connected to {dev} ({w}x{h} px screen). Streaming {monitor.DeviceName} ({monitor.Width}x{monitor.Height}).");
+            int proto = r.TryGetProperty("proto", out var pp) && pp.TryGetInt32(out int pv) ? pv : 1;
+            bool acks = proto >= 2 && r.TryGetProperty("acks", out var ap) && ap.ValueKind == JsonValueKind.True;
+            _clientProto = proto;
+            _pacer.Enabled = acks && opt.MaxInFlight > 0;
+
+            Log.Info($"Connected to {dev} ({w}x{h} px screen, protocol {proto}). Streaming {monitor.DeviceName} ({monitor.Width}x{monitor.Height}).");
+            if (proto < 2) Log.Info("This iPad app is an older version: update it for frame pacing (smoother on slow links).");
             if (w > 0 && h > 0)
             {
                 double a1 = (double)Math.Max(w, h) / Math.Min(w, h), a2 = (double)monitor.Width / monitor.Height;
@@ -307,5 +357,9 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             }
         }
         catch (JsonException) { }
+        finally
+        {
+            try { _helloReceived.Set(); } catch (ObjectDisposedException) { }
+        }
     }
 }

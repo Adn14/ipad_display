@@ -8,7 +8,8 @@ internal sealed class Options
     public string? AudioDevice;        // null = "iPad" / "Virtual Audio" output device
     public string? Monitor;            // null = first non-primary monitor
     public string Encoder = "auto";
-    public int Fps = 60;
+    public int Fps;                    // 0 = match the monitor's refresh rate (max 120)
+    public int MaxInFlight = 3;        // frames sent but not yet acknowledged before dropping; 0 = never drop
     public int BitrateMbps = 30;
     public int Port = 7878;
     public string? WifiHost;           // connect over the network instead of USB
@@ -37,7 +38,8 @@ internal sealed class Options
                     if (o.Encoder != "auto" && !FfmpegEncoder.Names.Contains(o.Encoder))
                         throw new ArgumentException($"--encoder must be auto, {string.Join(", ", FfmpegEncoder.Names)}");
                     break;
-                case "--fps": o.Fps = NextInt(10, 120); break;
+                case "--fps": o.Fps = NextInt(10, 240); break;
+                case "--max-inflight": o.MaxInFlight = NextInt(0, 60); break;
                 case "-b" or "--bitrate": o.BitrateMbps = NextInt(2, 200); break;
                 case "-p" or "--port": o.Port = NextInt(1, 65535); break;
                 case "-w" or "--wifi": o.WifiHost = Next(); break;
@@ -61,7 +63,8 @@ internal sealed class Options
           -m, --monitor N       monitor to stream: index from --list or \\.\DISPLAYn
                                 (default: first non-primary monitor = the virtual display)
           -e, --encoder NAME    auto | qsv (Intel) | nvenc (NVIDIA) | amf (AMD) | x264 (CPU)   [auto]
-              --fps N           frames per second                                          [60]
+              --fps N           frames per second                    [the monitor's refresh rate]
+              --max-inflight N  unacknowledged frames before dropping some (0 = never)   [3]
           -b, --bitrate MBPS    video bitrate in Mbit/s                                    [30]
           -w, --wifi IP         connect to the iPad over Wi-Fi at IP instead of USB
           -p, --port N          TCP port the iPad app listens on                           [7878]
@@ -122,13 +125,19 @@ internal static class Program
         }
         Log.Debug($"Using {ffmpeg}");
 
-        // Two hosts would keep stealing the iPad from each other (it accepts the newest connection).
-        using var single = new Mutex(true, @"Local\IPadScreenHost.Running", out bool firstInstance);
+        // Two hosts aimed at the same iPad would keep stealing it from each other (it accepts the newest
+        // connection). Hosts aimed at different targets (USB vs a Wi-Fi address/port) may coexist.
+        string target = opt.WifiHost is null ? "usb" : $"wifi-{opt.WifiHost}-{opt.Port}";
+        using var single = new Mutex(true, $@"Local\IPadScreenHost.Running.{target}", out bool firstInstance);
         if (!firstInstance)
         {
             Log.Error("IPadScreenHost is already running (another window, or the system tray). Close that one first.");
             return 1;
         }
+
+        // Steady-state streaming allocates almost nothing; keep the rare collections from blocking the
+        // video/input threads (no full blocking GCs unless memory is low).
+        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };

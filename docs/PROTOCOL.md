@@ -18,8 +18,8 @@ Coordinates are normalized to the streamed monitor: `0,0` is top-left and `1,1` 
 
 | type | name | payload |
 |---|---|---|
-| `0x01` | HostHello | UTF-8 JSON `{"proto":1,"width":2732,"height":2048,"name":"LAPTOP"}` |
-| `0x02` | Video | one complete H.264 access unit (one picture): repeated `[u32 BE length][NAL unit]`. SPS/PPS come with every keyframe (once a second). |
+| `0x01` | HostHello | UTF-8 JSON `{"proto":2,"width":2732,"height":2048,"name":"LAPTOP"}` |
+| `0x02` | Video | protocol 2: `u32 frame id` (LE), then one complete H.264 access unit (one picture) as repeated `[u32 BE length][NAL unit]`. Protocol 1: the access unit only. SPS/PPS come with every keyframe (once a second). |
 | `0x03` | HostInfo | UTF-8 JSON `{"encoder":"h264_qsv"}` |
 | `0x04` | AudioFormat | UTF-8 JSON `{"sampleRate":48000,"channels":2}`, sent before any audio |
 | `0x05` | Audio | interleaved 16-bit little-endian PCM (about 10 ms per message; nothing is sent while Windows is silent) |
@@ -28,13 +28,27 @@ Coordinates are normalized to the streamed monitor: `0,0` is top-left and `1,1` 
 
 | type | name | payload |
 |---|---|---|
-| `0x10` | ClientHello | UTF-8 JSON `{"proto":1,"device":"iPad","widthPx":2732,"heightPx":2048,"scale":2}` |
+| `0x10` | ClientHello | UTF-8 JSON `{"proto":2,"acks":true,"device":"iPad","widthPx":2732,"heightPx":2048,"scale":2}` |
 | `0x11` | Touch | `u8 count`, then `count` × `{u8 id (0-9), u8 phase, f32 x, f32 y, f32 pressure}`. Every frame lists **all** fingers currently down; fingers that didn't change are sent with phase `move`. |
 | `0x12` | Pen | `u8 phase, f32 x, f32 y, f32 pressure (0-1), f32 tiltX°, f32 tiltY°` |
 | `0x13` | Mouse | `u8 action, f32 x, f32 y, f32 dx, f32 dy` |
+| `0x14` | FrameAck | protocol 2: `u32 frame id`, sent once the frame has been handed to the decoder (or discarded) |
 
 phase: `0` down, `1` move, `2` up, `3` cancel
 
 mouse action: `0` move, `1` left down, `2` left up, `3` right down, `4` right up,
 `5` scroll (dx/dy in wheel units, 120 = one notch; +dy = up, +dx = right), `6` zoom (dy wheel units with Ctrl held),
 `7` middle click
+
+## Versions and frame pacing
+
+Each side announces its `proto` in its hello. The host waits up to 2 s for the ClientHello before it
+starts video, then uses the lower of the two versions. Protocol 2 adds frame ids and acks, so the host
+knows how many frames are in flight. When more than `--max-inflight` (default 3) are unacknowledged:
+
+- pictures with `nal_ref_idc == 0` (nothing references them) are dropped freely;
+- dropping any other picture breaks the reference chain, so the host then drops **every** frame until
+  the next IDR keyframe (at most 1 s; keyframes are forced once per second);
+- IDR pictures and SPS/PPS are never dropped.
+
+Drops happen on the host before serialization, so a dropped frame never touches the socket.

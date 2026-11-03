@@ -1,3 +1,6 @@
+using System.Buffers;
+using System.Buffers.Binary;
+
 namespace IPadScreenHost;
 
 /// <summary>
@@ -6,9 +9,12 @@ namespace IPadScreenHost;
 /// </summary>
 internal static class Msg
 {
+    public const int ProtocolVersion = 2;
+
     // host -> iPad
     public const byte HostHello = 0x01;   // UTF-8 JSON
-    public const byte Video = 0x02;       // one H.264 access unit: repeated [u32 BIG-endian NAL length][NAL]
+    public const byte Video = 0x02;       // v2: [u32 LE frame id] then one H.264 access unit as repeated [u32 BIG-endian NAL length][NAL]
+                                          // v1: the access unit only
     public const byte HostInfo = 0x03;    // UTF-8 JSON (encoder name etc.)
     public const byte AudioFormat = 0x04; // UTF-8 JSON {"sampleRate":48000,"channels":2}
     public const byte Audio = 0x05;       // interleaved 16-bit little-endian PCM
@@ -18,7 +24,9 @@ internal static class Msg
     public const byte Touch = 0x11;       // [u8 count] count x { u8 id, u8 phase, f32 x, f32 y, f32 pressure }
     public const byte Pen = 0x12;         // u8 phase, f32 x, f32 y, f32 pressure, f32 tiltX, f32 tiltY
     public const byte Mouse = 0x13;       // u8 action, f32 x, f32 y, f32 dx, f32 dy
+    public const byte FrameAck = 0x14;    // v2: u32 LE frame id, sent once the frame is handed to the decoder
 
+    public const int HeaderSize = 5;
     public const int MaxPayload = 32 * 1024 * 1024;
 }
 
@@ -32,125 +40,41 @@ internal enum MouseAction : byte
     MiddleClick = 7,
 }
 
-/// <summary>
-/// Splits an H.264 Annex-B byte stream (as written by ffmpeg -f h264) into access units (one
-/// complete picture each). Encoders may emit many slices per picture, and VideoToolbox on the iPad
-/// wants a whole picture per sample, so grouping happens here.
-/// An access unit is emitted as soon as the first header bytes of the *next* one are seen.
-/// </summary>
-internal sealed class AnnexBSplitter(Action<List<ArraySegment<byte>>> onAccessUnit)
+/// <summary>Allocation-free serialization of protocol messages into a reusable buffer writer.</summary>
+internal static class Wire
 {
-    private byte[] _buf = new byte[1 << 20];
-    private int _len;          // valid bytes in _buf
-    private int _nalStart = -1; // first byte (NAL header) of the NAL currently being received
-    private bool _headerChecked;
-    private int _scan;         // where to resume looking for the next start code
-    private readonly List<ArraySegment<byte>> _au = new();
-    private bool _auHasVcl;
-
-    public void Feed(ReadOnlySpan<byte> data)
+    public static void WriteHeader(IBufferWriter<byte> w, byte type, int payloadLength)
     {
-        EnsureFree(data.Length);
-        data.CopyTo(_buf.AsSpan(_len));
-        _len += data.Length;
+        Span<byte> s = w.GetSpan(Msg.HeaderSize);
+        s[0] = type;
+        BinaryPrimitives.WriteInt32LittleEndian(s.Slice(1), payloadLength);
+        w.Advance(Msg.HeaderSize);
+    }
 
-        while (true)
+    public static void WriteUInt32LittleEndian(IBufferWriter<byte> w, uint value)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(w.GetSpan(4), value);
+        w.Advance(4);
+    }
+
+    public static void WriteUInt32BigEndian(IBufferWriter<byte> w, uint value)
+    {
+        BinaryPrimitives.WriteUInt32BigEndian(w.GetSpan(4), value);
+        w.Advance(4);
+    }
+
+    public static void Write(IBufferWriter<byte> w, in ReadOnlySequence<byte> source)
+    {
+        foreach (var segment in source)
         {
-            if (_nalStart < 0)
-            {
-                int sc = FindStartCode(Math.Max(_scan, 0));
-                if (sc < 0) { _scan = Math.Max(0, _len - 2); return; }
-                _nalStart = sc + 3;
-                _headerChecked = false;
-                _scan = _nalStart;
-            }
-
-            if (!_headerChecked)
-            {
-                if (_len < _nalStart + 2) return;
-                if (StartsNewAccessUnit(_buf[_nalStart], _buf[_nalStart + 1]) && _auHasVcl)
-                    EmitAccessUnit();
-                _headerChecked = true;
-            }
-
-            int next = FindStartCode(_scan);
-            if (next < 0)
-            {
-                _scan = Math.Max(_nalStart, _len - 2);
-                Compact();
-                return;
-            }
-
-            int end = next;
-            while (end > _nalStart && _buf[end - 1] == 0) end--; // drop zero_byte / trailing zeros
-            if (end > _nalStart)
-            {
-                int type = _buf[_nalStart] & 0x1F;
-                _au.Add(new ArraySegment<byte>(_buf.AsSpan(_nalStart, end - _nalStart).ToArray()));
-                if (type is 1 or 5) _auHasVcl = true;
-            }
-            _nalStart = next + 3;
-            _headerChecked = false;
-            _scan = _nalStart;
+            segment.Span.CopyTo(w.GetSpan(segment.Length));
+            w.Advance(segment.Length);
         }
     }
 
-    /// <summary>H.264 7.4.1.2.3: which NAL units begin a new access unit (given a picture is pending).</summary>
-    private static bool StartsNewAccessUnit(byte header, byte firstPayloadByte)
+    public static void Write(IBufferWriter<byte> w, ReadOnlySpan<byte> source)
     {
-        int type = header & 0x1F;
-        return type switch
-        {
-            9 or 7 or 8 or 6 or (>= 14 and <= 18) => true,     // AUD, SPS, PPS, SEI, reserved
-            1 or 5 => (firstPayloadByte & 0x80) != 0,          // first_mb_in_slice == 0 (ue(v) "1")
-            _ => false,
-        };
-    }
-
-    private void EmitAccessUnit()
-    {
-        var au = new List<ArraySegment<byte>>(_au);
-        _au.Clear();
-        _auHasVcl = false;
-        onAccessUnit(au);
-    }
-
-    private int FindStartCode(int from)
-    {
-        var span = _buf.AsSpan(0, _len);
-        for (int i = Math.Max(from, 0); i + 2 < span.Length; i++)
-        {
-            int j = span.Slice(i, span.Length - i).IndexOf((byte)0);
-            if (j < 0) return -1;
-            i += j;
-            if (i + 2 < span.Length && span[i + 1] == 0 && span[i + 2] == 1) return i;
-        }
-        return -1;
-    }
-
-    private void Compact()
-    {
-        // Keep the NAL in progress; discard everything before it once it's a sizeable chunk.
-        int keepFrom = _nalStart;
-        if (keepFrom < _buf.Length / 2) return;
-        Buffer.BlockCopy(_buf, keepFrom, _buf, 0, _len - keepFrom);
-        _len -= keepFrom;
-        _scan -= keepFrom;
-        _nalStart = 0;
-    }
-
-    private void EnsureFree(int extra)
-    {
-        if (_len + extra <= _buf.Length) return;
-        if (_nalStart > 0)
-        {
-            int shift = _nalStart;
-            Buffer.BlockCopy(_buf, shift, _buf, 0, _len - shift);
-            _len -= shift;
-            _scan -= shift;
-            _nalStart = 0;
-        }
-        if (_len + extra > _buf.Length)
-            Array.Resize(ref _buf, Math.Max(_buf.Length * 2, _len + extra));
+        source.CopyTo(w.GetSpan(source.Length));
+        w.Advance(source.Length);
     }
 }
