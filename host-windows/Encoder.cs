@@ -68,7 +68,7 @@ internal sealed class FfmpegEncoder : IDisposable
         // bursts. Microsecond timestamps: at 1/fps, two updates within one tick collide and the muxer
         // discards one - and losing a P-frame corrupts every frame after it.
         string args =
-            "-hide_banner -loglevel error -nostdin " +
+            $"-hide_banner -loglevel {(Log.Verbose ? "warning" : "error")} -nostdin " +
             $"-init_hw_device \"{captureDevice}\" {encodeDevice}-filter_hw_device dx " +
             $"-filter_complex \"ddagrab=output_idx={mon.OutputIndex}:framerate={fps}:draw_mouse=1{filterTail}\" " +
             $"-fps_mode passthrough -enc_time_base 1:1000000 " +

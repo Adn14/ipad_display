@@ -9,6 +9,8 @@ namespace IPadScreenHost;
 internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, string ffmpeg, InputInjector input)
 {
     private static string? _workingEncoder; // remembered across reconnects
+    // --record: the exact H.264 sent to the iPad (Annex-B), for checking glitches frame by frame.
+    private static FileStream? _record;
     private readonly object _writeLock = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly ManualResetEventSlim _helloReceived = new();
@@ -246,6 +248,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
         _lastAuTimestamp = now;
         if (!_pacer.TryAdmit(in au, out uint frameId)) return; // dropped before it touches the socket
         if (Log.Verbose && au.IsIdr) Log.Debug($"Keyframe {frameId} ({au.AvccLength / 1024} KB).");
+        if (opt.RecordPath is not null) Record(au.Buffer);
 
         bool withFrameId = _clientProto >= 2;
         var w = _videoOut;
@@ -258,6 +261,17 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             Wire.Write(w, au.Buffer.Slice(nal.Start, nal.Length));
         }
         Write(w.WrittenSpan);
+    }
+
+    private void Record(in ReadOnlySequence<byte> annexB)
+    {
+        try
+        {
+            // Unbuffered: the file is complete even if the host is closed with Ctrl+C or the window's X.
+            _record ??= new FileStream(opt.RecordPath!, FileMode.Create, FileAccess.Write, FileShare.Read, bufferSize: 0);
+            foreach (var segment in annexB) _record.Write(segment.Span);
+        }
+        catch (IOException e) { Log.Warn($"Recording stopped: {e.Message}"); opt.RecordPath = null; }
     }
 
     /// <summary>Rare control messages; allocation is fine here.</summary>

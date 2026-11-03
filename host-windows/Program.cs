@@ -14,6 +14,7 @@ internal sealed class Options
     public int Port = 7878;
     public string? WifiHost;           // connect over the network instead of USB
     public string? FfmpegPath;
+    public string? RecordPath;         // save the video sent to the iPad (diagnostics)
 
     public static Options Parse(string[] args)
     {
@@ -44,6 +45,7 @@ internal sealed class Options
                 case "-p" or "--port": o.Port = NextInt(1, 65535); break;
                 case "-w" or "--wifi": o.WifiHost = Next(); break;
                 case "--ffmpeg": o.FfmpegPath = Next(); break;
+                case "--record": o.RecordPath = Next(); break;
                 case "--no-input": o.NoInput = true; break;
                 case "--test-input": o.TestInput = true; break;
                 case "-a" or "--audio-device": o.AudioDevice = Next(); break;
@@ -75,6 +77,7 @@ internal sealed class Options
               --no-input        view only; ignore touches from the iPad
               --test-input      check that touch/pen/mouse injection works (moves the cursor), then exit
           -v, --verbose         print FFmpeg output and stream statistics
+              --record FILE     save the exact video sent to the iPad (H.264) to FILE, for diagnosing glitches
         """);
 }
 
