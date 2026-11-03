@@ -12,7 +12,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
     private readonly object _writeLock = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly ManualResetEventSlim _helloReceived = new();
-    private readonly FramePacer _pacer = new(opt.MaxInFlight);
+    private readonly FramePacer _pacer = new(opt.MaxLagMs);
     // Reusable serialization buffers: grow to the largest message once, then no per-frame allocation.
     private readonly ArrayBufferWriter<byte> _videoOut = new(1 << 20); // video thread only
     private readonly ArrayBufferWriter<byte> _audioOut = new(16 << 10); // audio capture thread only
@@ -133,7 +133,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
 
             if (_workingEncoder != name || !_announced)
                 Log.Info($"Encoder: {name} ({enc.Codec}), {monitor.Width}x{monitor.Height} @ {fps} fps, {opt.BitrateMbps} Mbps" +
-                         (_pacer.Enabled ? $", pacing at {opt.MaxInFlight} frames in flight" : ""));
+                         (_pacer.Enabled ? $", dropping frames beyond {opt.MaxLagMs} ms behind" : ""));
             if (_workingEncoder != name || !_announced) SendJson(Msg.HostInfo, new { encoder = enc.Codec });
             _workingEncoder = name;
             _announced = true;
@@ -141,7 +141,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             // Stream until the iPad disconnects or ffmpeg exits (e.g. display mode changed).
             var statsTimer = Stopwatch.StartNew();
             var geometryTimer = Stopwatch.StartNew();
-            long lastBytes = 0, lastAus = 0, lastDropped = _pacer.Dropped;
+            long lastBytes = Interlocked.Read(ref _bytesSent), lastAus = 0;
             bool resized = false, keyframe = false;
             while (!_cts.IsCancellationRequested && !enc.HasExited)
             {
@@ -162,12 +162,13 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
                 }
                 if (opt.Verbose && statsTimer.ElapsedMilliseconds >= 5000)
                 {
-                    long b = Interlocked.Read(ref _bytesSent), a = Interlocked.Read(ref enc.AccessUnits), d = _pacer.Dropped;
+                    long b = Interlocked.Read(ref _bytesSent), a = Interlocked.Read(ref enc.AccessUnits);
                     double secs = statsTimer.Elapsed.TotalSeconds;
                     double maxGapMs = Interlocked.Exchange(ref _maxAuGap, 0) * 1000.0 / Stopwatch.Frequency;
                     Log.Debug($"{(a - lastAus) / secs:F1} fps encoded (max gap {maxGapMs:F0} ms), {(b - lastBytes) * 8 / secs / 1e6:F1} Mbps" +
-                              (_pacer.Enabled ? $", {(d - lastDropped) / secs:F1} dropped/s, {_pacer.InFlight} in flight" : ""));
-                    lastBytes = b; lastAus = a; lastDropped = d;
+                              (_pacer.Enabled ? $", {_pacer.InFlight} in flight; this session: {_pacer.Dropped} dropped, " +
+                                                $"{_pacer.KeyframesRequested} keyframe requests" : ""));
+                    lastBytes = b; lastAus = a;
                     statsTimer.Restart();
                 }
             }
@@ -365,7 +366,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
             int proto = r.TryGetProperty("proto", out var pp) && pp.TryGetInt32(out int pv) ? pv : 1;
             bool acks = proto >= 2 && r.TryGetProperty("acks", out var ap) && ap.ValueKind == JsonValueKind.True;
             _clientProto = proto;
-            _pacer.Enabled = acks && opt.MaxInFlight > 0;
+            _pacer.Enabled = acks && opt.MaxLagMs > 0;
 
             Log.Info($"Connected to {dev} ({w}x{h} px screen, protocol {proto}). Streaming {monitor.DeviceName} ({monitor.Width}x{monitor.Height}).");
             if (proto < 2) Log.Info("This iPad app is an older version: update it for frame pacing (smoother on slow links).");

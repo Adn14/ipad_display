@@ -9,7 +9,7 @@ internal sealed class Options
     public string? Monitor;            // null = first non-primary monitor
     public string Encoder = "auto";
     public int Fps;                    // 0 = match the monitor's refresh rate (max 120)
-    public int MaxInFlight = 3;        // frames sent but not yet acknowledged before dropping; 0 = never drop
+    public int MaxLagMs = 200;         // drop frames once the iPad is this far behind (oldest unacked frame); 0 = never
     public int BitrateMbps = 30;
     public int Port = 7878;
     public string? WifiHost;           // connect over the network instead of USB
@@ -39,7 +39,7 @@ internal sealed class Options
                         throw new ArgumentException($"--encoder must be auto, {string.Join(", ", FfmpegEncoder.Names)}");
                     break;
                 case "--fps": o.Fps = NextInt(10, 240); break;
-                case "--max-inflight": o.MaxInFlight = NextInt(0, 60); break;
+                case "--max-lag": o.MaxLagMs = NextInt(0, 5000); break;
                 case "-b" or "--bitrate": o.BitrateMbps = NextInt(2, 200); break;
                 case "-p" or "--port": o.Port = NextInt(1, 65535); break;
                 case "-w" or "--wifi": o.WifiHost = Next(); break;
@@ -64,7 +64,7 @@ internal sealed class Options
                                 (default: first non-primary monitor = the virtual display)
           -e, --encoder NAME    auto | qsv (Intel) | nvenc (NVIDIA) | amf (AMD) | x264 (CPU)   [auto]
               --fps N           frames per second                    [the monitor's refresh rate]
-              --max-inflight N  unacknowledged frames before dropping some (0 = never)   [3]
+              --max-lag MS      drop frames once the iPad is this far behind (0 = never)  [200]
           -b, --bitrate MBPS    video bitrate in Mbit/s                                    [30]
           -w, --wifi IP         connect to the iPad over Wi-Fi at IP instead of USB
           -p, --port N          TCP port the iPad app listens on                           [7878]

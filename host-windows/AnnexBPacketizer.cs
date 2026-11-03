@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Buffers;
 using System.IO.Pipelines;
 
@@ -203,33 +204,52 @@ internal sealed class AnnexBPacketizer(AccessUnitSink sink)
 }
 
 /// <summary>
-/// Backpressure for the video stream, based on frames sent but not yet acknowledged by the iPad.
+/// Backpressure for the video stream, based on how long the oldest frame not yet acknowledged by the
+/// iPad has been waiting - i.e. how far behind the iPad really is.
+///
+/// Not a frame count: FFmpeg releases frames in bunches of 4-5, and acks need a few milliseconds to
+/// come back over USB, so a count threshold trips on every bunch even though nothing is lagging.
 ///
 /// H.264 P-frames reference the frame before them, so dropping one corrupts every later frame until
-/// the next keyframe. Rules, when too many frames are in flight:
+/// the next keyframe. Rules, once the iPad is too far behind:
 ///  - disposable pictures (nal_ref_idc == 0) are dropped freely;
 ///  - dropping a reference picture switches to "skip until IDR": everything is dropped until the next
 ///    keyframe, which restarts a clean reference chain (and a keyframe is requested right away);
 ///  - IDR pictures and parameter sets are never dropped.
 /// The packetizer thread calls <see cref="TryAdmit"/>; the input thread calls <see cref="Ack"/>.
 /// </summary>
-internal sealed class FramePacer(int maxInFlight)
+internal sealed class FramePacer(int maxLagMs)
 {
-    private uint _issued;       // next frame id (packetizer thread only)
-    private uint _acked;        // highest acknowledged frame id + 1 (written by the input thread)
-    private bool _skipUntilIdr; // packetizer thread only
-    private long _dropped;
+    private const int Ring = 1024;                 // send times of the last 1024 frame ids
+    private readonly long[] _sentAt = new long[Ring]; // packetizer thread only
+    private readonly long _maxLagTicks = maxLagMs * Stopwatch.Frequency / 1000;
+    private uint _issued;        // next frame id (packetizer thread only)
+    private uint _acked;         // highest acknowledged frame id + 1 (written by the input thread)
+    private bool _skipUntilIdr;  // packetizer thread only
+    private long _dropped, _keyframesRequested;
     private int _keyframeWanted; // 1 = someone needs an IDR soon (any thread)
 
     /// <summary>Only when the iPad sends acks (protocol v2); otherwise every frame is sent.</summary>
     public volatile bool Enabled;
 
     public long Dropped => Interlocked.Read(ref _dropped);
-    public int InFlight => (int)(_issued - Volatile.Read(ref _acked));
+    public long KeyframesRequested => Interlocked.Read(ref _keyframesRequested);
+    public int InFlight => (int)(Volatile.Read(ref _issued) - Volatile.Read(ref _acked));
+
+    /// <summary>Age of the oldest unacknowledged frame (0 when the iPad is caught up). Packetizer thread.</summary>
+    private long OldestUnackedTicks(long now)
+    {
+        uint acked = Volatile.Read(ref _acked);
+        uint inFlight = _issued - acked;
+        if (inFlight == 0) return 0;
+        if (inFlight >= Ring) return long.MaxValue; // far behind; the ring no longer covers it
+        return now - _sentAt[acked % Ring];
+    }
 
     public bool TryAdmit(in AccessUnit au, out uint frameId)
     {
         frameId = 0;
+        long now = Stopwatch.GetTimestamp();
         if (Enabled)
         {
             bool mustSend = au.IsIdr || au.HasParameterSets;
@@ -238,7 +258,7 @@ internal sealed class FramePacer(int maxInFlight)
                 if (!mustSend) return Drop();
                 _skipUntilIdr = false;
             }
-            else if (!mustSend && InFlight >= maxInFlight)
+            else if (!mustSend && OldestUnackedTicks(now) > _maxLagTicks)
             {
                 if (!au.IsDisposable)
                 {
@@ -249,12 +269,17 @@ internal sealed class FramePacer(int maxInFlight)
             }
         }
         frameId = _issued;
+        _sentAt[frameId % Ring] = now;
         Volatile.Write(ref _issued, _issued + 1);
         return true;
     }
 
     /// <summary>Ask for a fresh IDR (the session restarts the encoder). Any thread.</summary>
-    public void RequestKeyframe() => Volatile.Write(ref _keyframeWanted, 1);
+    public void RequestKeyframe()
+    {
+        Interlocked.Increment(ref _keyframesRequested);
+        Volatile.Write(ref _keyframeWanted, 1);
+    }
 
     /// <summary>True once per request.</summary>
     public bool TakeKeyframeRequest() => Interlocked.Exchange(ref _keyframeWanted, 0) == 1;

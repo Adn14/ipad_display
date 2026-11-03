@@ -45,7 +45,8 @@ mouse action: `0` move, `1` left down, `2` left up, `3` right down, `4` right up
 
 Each side announces its `proto` in its hello. The host waits up to 2 s for the ClientHello before it
 starts video, then uses the lower of the two versions. Protocol 2 adds frame ids and acks, so the host
-knows how many frames are in flight. When more than `--max-inflight` (default 3) are unacknowledged:
+knows how far behind the iPad is: the age of the oldest frame it hasn't acknowledged. When that exceeds
+`--max-lag` (default 200 ms) - real lag building up, not just a bunch of frames FFmpeg released at once:
 
 - pictures with `nal_ref_idc == 0` (nothing references them) are dropped freely;
 - dropping any other picture breaks the reference chain, so the host then drops **every** frame until
