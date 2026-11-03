@@ -112,6 +112,7 @@ internal sealed class AnnexBPacketizer(AccessUnitSink sink)
     /// <summary>Parses as far as possible; returns the part that must stay in the pipe.</summary>
     private ReadOnlySequence<byte> Process(ReadOnlySequence<byte> buffer)
     {
+        Span<byte> head = stackalloc byte[2];
         while (true)
         {
             if (_nalStart < 0)
@@ -134,7 +135,6 @@ internal sealed class AnnexBPacketizer(AccessUnitSink sink)
             if (!_headerChecked)
             {
                 if (buffer.Length < _nalStart + 2) return buffer;
-                Span<byte> head = stackalloc byte[2];
                 buffer.Slice(_nalStart, 2).CopyTo(head);
                 if (_auHasPicture && StartsNewAccessUnit(head[0], head[1]))
                 {

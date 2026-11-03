@@ -32,8 +32,10 @@ internal sealed class FfmpegEncoder : IDisposable
         // Keyframes only when needed. A periodic keyframe redraws the whole picture at a lower quality
         // than the frames that refine it, so still areas (the taskbar) visibly "pulse" each time one
         // arrives. The stream starts with one; recovery (dropped frames, or the iPad's decoder asking)
-        // restarts the encoder for a fresh one. -g is only a long safety net.
-        int gop = fps * 60;
+        // restarts the encoder for a fresh one. -g is only a safety net, as long as every encoder allows
+        // (QSV's GOP size is 16-bit): 9-18 minutes. A shorter one showed up as a blink each time it fired
+        // during motion - the keyframe can't get enough bits then.
+        const int gop = 65535;
         // Half a second of rate-control buffer: keyframes get the bits they need to match the frames
         // around them. They're rare now, so a large one costs at most a one-off hitch.
         int vbv = kbps / 2;

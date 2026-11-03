@@ -245,6 +245,7 @@ internal sealed class Session(Stream stream, MonitorInfo monitor, Options opt, s
         }
         _lastAuTimestamp = now;
         if (!_pacer.TryAdmit(in au, out uint frameId)) return; // dropped before it touches the socket
+        if (Log.Verbose && au.IsIdr) Log.Debug($"Keyframe {frameId} ({au.AvccLength / 1024} KB).");
 
         bool withFrameId = _clientProto >= 2;
         var w = _videoOut;
