@@ -138,6 +138,7 @@ internal sealed class InputInjector : IDisposable
 
     private static POINTER_TYPE_INFO MakeTouch(uint id, uint flags, int x, int y, uint pressure)
     {
+        (x, y) = ToInjected(x, y);
         var info = new POINTER_TYPE_INFO { type = PT_TOUCH };
         info.touchInfo.pointerInfo.pointerType = PT_TOUCH;
         info.touchInfo.pointerInfo.pointerId = id;
@@ -192,6 +193,7 @@ internal sealed class InputInjector : IDisposable
 
     private static POINTER_TYPE_INFO MakePen(uint flags, int x, int y, uint pressure, int tiltX, int tiltY)
     {
+        (x, y) = ToInjected(x, y);
         var info = new POINTER_TYPE_INFO { type = PT_PEN };
         info.penInfo.pointerInfo.pointerType = PT_PEN;
         info.penInfo.pointerInfo.pointerId = 0;
@@ -302,6 +304,14 @@ internal sealed class InputInjector : IDisposable
         int y = m.Top + (int)MathF.Round(Math.Clamp(ny, 0f, 1f) * (m.Height - 1));
         return (x, y);
     }
+
+    /// <summary>
+    /// Screen pixel to the position InjectSyntheticPointerInput expects. Measured: Windows reads it relative
+    /// to the virtual screen's top-left, not as a screen coordinate - so with a monitor placed above or left
+    /// of the primary (negative coordinates) every touch landed that far off (453 px up, in one layout).
+    /// </summary>
+    private static (int X, int Y) ToInjected(int x, int y) =>
+        (x - GetSystemMetrics(SM_XVIRTUALSCREEN), y - GetSystemMetrics(SM_YVIRTUALSCREEN));
 
     private void Inject(IntPtr device, POINTER_TYPE_INFO[] frame, string what)
     {
